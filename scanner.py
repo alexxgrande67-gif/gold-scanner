@@ -98,6 +98,7 @@ def wilder_atr(highs, lows, closes, period=14):
 
 
 
+
 def build_stable_universe():
     """Apply the original stability and ATR filters using Bybit data."""
     items = bybit_universe()
