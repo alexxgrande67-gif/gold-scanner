@@ -30,6 +30,7 @@ def parse_binance_klines(rows):
 
 
 
+
 def bybit_universe():
     """Build USDT perpetual universe from Bybit, ranked by 24h turnover."""
     supported = bybit_symbols()
