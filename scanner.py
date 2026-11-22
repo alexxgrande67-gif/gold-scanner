@@ -705,6 +705,67 @@ def load_state():
         "seeded_symbols": []
     }
 
+def send_telegram(sym, event, atr_pct):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("[ERROR] Telegram credentials are missing", flush=True)
+        return False
+
+    side = (
+        "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ 🔴"
+        if event["side"] == "H"
+        else "ЛОЖНЫЙ ПРОБОЙ ВНИЗ 🟢"
+    )
+
+    dt = time.strftime(
+        "%d.%m.%Y %H:%M UTC",
+        time.gmtime(event["touch"])
+    )
+
+    message = (
+        "🟡 <b>GOLD SCANNER</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"Монета: <b>{html.escape(sym)}</b>\n"
+        f"Сигнал: <b>{side}</b>\n"
+        f"Уровень: <code>{event['price']:.12g}</code>\n"
+        f"Время свечи: {dt}\n"
+        f"ATR: {atr_pct:.2f}%\n"
+        "Биржа: OKX / Gate.io\n"
+        "━━━━━━━━━━━━━━"
+    )
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    try:
+        response = SESSION.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=20
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("ok") is True:
+            print(f"[TELEGRAM] Sent: {sym}", flush=True)
+            return True
+
+        print("[ERROR] Telegram rejected the message", flush=True)
+        return False
+
+    except Exception as exc:
+        print(
+            f"[ERROR] Telegram delivery failed: {type(exc).__name__}",
+            flush=True
+        )
+        return False
 
 def main():
     global ACTIVE_EXCHANGE
