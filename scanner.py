@@ -355,7 +355,6 @@ def build_stable_universe():
         ACTIVE_EXCHANGE = "gate"
 
     # No volatility filtering.
-    # Select the most liquid symbols up to MAX_MONITORED.
     selected = items[:MAX_MONITORED]
 
     print(
@@ -665,7 +664,8 @@ def fb_compute(days, m5, now_ms=None):
                 events.append({
                     "side": "L",
                     "price": x["price"],
-                    "time": x["time"]
+                    "time": x["time"],
+                    "touch": b["time"]
                 })
 
                 continue
@@ -772,8 +772,7 @@ def main():
                 )
                 continue
 
-            # ATR is calculated for information only.
-            # It does NOT exclude or reject any symbol.
+            # ATR is informational only; it does not filter symbols.
             highs = [d["high"] for d in days[:-1]]
             lows = [d["low"] for d in days[:-1]]
             closes = [d["close"] for d in days[:-1]]
@@ -791,7 +790,6 @@ def main():
             )
 
             result = fb_compute(days, m5)
-
             is_new_symbol = sym not in seeded
 
             for event in result["events"]:
