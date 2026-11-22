@@ -7,7 +7,6 @@ import json
 import html
 import math
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -41,7 +40,6 @@ def get_json(url: str, params: dict | None = None, timeout: int = 25):
 
 
 def _okx_rows(inst_id: str, bar: str, limit: int):
-    """Fetch OKX candles."""
     rows_by_ts = {}
     cursor = None
 
@@ -105,7 +103,6 @@ def _gate_rows(contract: str, interval: str, limit: int):
 
 
 def _canonical_from_okx(inst_id: str):
-    # BTC-USDT-SWAP -> BTCUSDT
     return (
         inst_id[:-10] + "USDT"
         if inst_id.endswith("-USDT-SWAP")
@@ -227,7 +224,6 @@ def _gate_universe():
 
 
 def daily_returns(klines):
-    # Exclude today's still-forming daily bar.
     out = {}
 
     for i in range(1, max(1, len(klines) - 1)):
@@ -336,10 +332,6 @@ def _normalise_rows(rows, source):
 
 
 def build_stable_universe():
-    """
-    Build monitored universe.
-    No ATR filter and no BTC stability filter.
-    """
     global ACTIVE_EXCHANGE
 
     try:
@@ -355,7 +347,6 @@ def build_stable_universe():
         items = _gate_universe()
         ACTIVE_EXCHANGE = "gate"
 
-    # No volatility filtering.
     selected = items[:MAX_MONITORED]
 
     print(
@@ -373,9 +364,7 @@ def build_stable_universe():
 
 
 def get_bars(exchange, symbol, interval, limit):
-    source = exchange
-
-    if source == "okx":
+    if exchange == "okx":
         inst_id = symbol.replace(
             "USDT",
             "-USDT-SWAP"
@@ -705,6 +694,7 @@ def load_state():
         "seeded_symbols": []
     }
 
+
 def send_telegram(sym, event, atr_pct):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -732,7 +722,7 @@ def send_telegram(sym, event, atr_pct):
         f"Уровень: <code>{event['price']:.12g}</code>\n"
         f"Время свечи: {dt}\n"
         f"ATR: {atr_pct:.2f}%\n"
-        "Биржа: OKX / Gate.io\n"
+        f"Биржа: {ACTIVE_EXCHANGE.upper()}\n"
         "━━━━━━━━━━━━━━"
     )
 
@@ -767,6 +757,7 @@ def send_telegram(sym, event, atr_pct):
         )
         return False
 
+
 def send_telegram_test():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -785,7 +776,7 @@ def send_telegram_test():
     )
 
     try:
-        response = requests.post(
+        response = SESSION.post(
             url,
             json={
                 "chat_id": chat_id,
@@ -803,19 +794,31 @@ def send_telegram_test():
             print("[TELEGRAM TEST] Message sent successfully", flush=True)
             return True
 
-        print(f"[TELEGRAM TEST] API error: {result}", flush=True)
+        print("[TELEGRAM TEST] Telegram API rejected the message", flush=True)
         return False
 
     except Exception as exc:
-        print(f"[TELEGRAM TEST] Failed: {exc}", flush=True)
+        print(
+            f"[TELEGRAM TEST] Failed: {type(exc).__name__}",
+            flush=True
+        )
         return False
-        
+
+
 def main():
     global ACTIVE_EXCHANGE
 
     print("GOLD SCANNER: start", flush=True)
-        if os.getenv("TELEGRAM_TEST") == "1":
-        send_telegram_test()
+
+    # Test message is sent only during a manual workflow run
+    # with telegram_test=true.
+    if os.getenv("TELEGRAM_TEST") == "1":
+        test_ok = send_telegram_test()
+
+        if not test_ok:
+            raise RuntimeError("Telegram test message was not delivered")
+
+        print("[TELEGRAM TEST] Test completed; continuing scanner.", flush=True)
 
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
@@ -932,10 +935,9 @@ def main():
             flush=True
         )
 
-    # Исторические события новых монет не отправляем.
+    # Historical events of newly monitored symbols are not sent.
     seen.update(seed_keys)
 
-    # Отправляем только новые сигналы.
     sent_count = 0
     failed_count = 0
 
@@ -979,5 +981,7 @@ def main():
         f"exchange={exchange}",
         flush=True
     )
+
+
 if __name__ == "__main__":
     main()
