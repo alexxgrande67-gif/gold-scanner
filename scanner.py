@@ -335,7 +335,10 @@ def _normalise_rows(rows, source):
 
 
 def build_stable_universe():
-    """Build monitored universe without BTC stability filtering."""
+    """
+    Build monitored universe.
+    No ATR filter and no BTC stability filter.
+    """
     global ACTIVE_EXCHANGE
 
     try:
@@ -351,62 +354,22 @@ def build_stable_universe():
         items = _gate_universe()
         ACTIVE_EXCHANGE = "gate"
 
-    stable = []
+    # No volatility filtering.
+    # Select the most liquid symbols up to MAX_MONITORED.
+    selected = items[:MAX_MONITORED]
 
     print(
-        f"[INFO] Stability filter disabled. "
-        f"Top universe={len(items)}; ATR limit=4%; "
-        f"monitor cap={MAX_MONITORED}",
+        f"[INFO] ATR filter disabled. "
+        f"BTC stability filter disabled. "
+        f"Top universe={len(items)}; "
+        f"monitoring={len(selected)}",
         flush=True
     )
 
-    for rank, (sym, quote_volume) in enumerate(items):
-        try:
-            kl = _normalise_rows(
-                _daily_rows(sym, 120),
-                ACTIVE_EXCHANGE
-            )
-
-            if len(kl) < 90:
-                continue
-
-            highs = [float(k[2]) for k in kl]
-            lows = [float(k[3]) for k in kl]
-            closes = [float(k[4]) for k in kl]
-
-            atr = wilder_atr(
-                highs[:-1],
-                lows[:-1],
-                closes[:-1],
-                14
-            )
-
-            if not atr or closes[-1] <= 0:
-                continue
-
-            atr_pct = atr / closes[-1] * 100
-
-            # BTC stability filter disabled.
-            # Only ATR <= 4% is retained.
-            if atr_pct <= 4:
-                stable.append(
-                    (sym, quote_volume, atr_pct)
-                )
-
-        except Exception as exc:
-            print(
-                f"[WARN] {ACTIVE_EXCHANGE} daily {sym}: {exc}",
-                flush=True
-            )
-
-        time.sleep(0.06)
-
-    print(
-        f"[INFO] ATR filter passed: {len(stable)} symbols",
-        flush=True
-    )
-
-    return stable[:MAX_MONITORED]
+    return [
+        (sym, quote_volume, None)
+        for sym, quote_volume in selected
+    ]
 
 
 def get_bars(exchange, symbol, interval, limit):
@@ -702,8 +665,7 @@ def fb_compute(days, m5, now_ms=None):
                 events.append({
                     "side": "L",
                     "price": x["price"],
-                    "time": x["time"],
-                    "touch": b["time"]
+                    "time": x["time"]
                 })
 
                 continue
@@ -752,14 +714,14 @@ def main():
     exchange = ACTIVE_EXCHANGE
 
     print(
-        f"Universe filtered: {len(symbols)} symbols; "
+        f"Universe selected: {len(symbols)} symbols; "
         f"monitor cap={MAX_MONITORED}; exchange={exchange}",
         flush=True
     )
 
     if not symbols:
         raise RuntimeError(
-            "No symbols passed the ATR filter"
+            "No symbols available in the selected universe"
         )
 
     state = load_state()
@@ -768,7 +730,7 @@ def main():
     discovered = []
     all_keys = []
 
-    for idx, (sym, vol, atr_pct) in enumerate(symbols, 1):
+    for idx, (sym, vol, _) in enumerate(symbols, 1):
         try:
             days_raw = get_bars(
                 exchange, sym, "1d", 700
@@ -803,7 +765,30 @@ def main():
             ]
 
             if len(days) < 60 or len(m5) < 30:
+                print(
+                    f"[WARN] {sym}: insufficient candle history "
+                    f"(daily={len(days)}, 5m={len(m5)})",
+                    flush=True
+                )
                 continue
+
+            # ATR is calculated for information only.
+            # It does NOT exclude or reject any symbol.
+            highs = [d["high"] for d in days[:-1]]
+            lows = [d["low"] for d in days[:-1]]
+            closes = [d["close"] for d in days[:-1]]
+
+            atr_value = wilder_atr(
+                highs, lows, closes, 14
+            )
+
+            last_close = days[-1]["close"]
+
+            atr_pct = (
+                atr_value / last_close * 100
+                if atr_value and last_close > 0
+                else 0.0
+            )
 
             result = fb_compute(days, m5)
 
@@ -825,7 +810,7 @@ def main():
             if is_new_symbol:
                 seeded.add(sym)
 
-            if idx % 10 == 0:
+            if idx % 10 == 0 or idx == len(symbols):
                 print(
                     f"Progress: {idx}/{len(symbols)}",
                     flush=True
