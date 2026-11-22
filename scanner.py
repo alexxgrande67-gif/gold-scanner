@@ -29,26 +29,36 @@ def parse_binance_klines(rows):
              "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in rows]
 
 
-def binance_universe():
-    info = get_json(BINANCE + "/fapi/v1/exchangeInfo")
-    valid = set()
-    for s in info.get("symbols", []):
-        if s.get("status") != "TRADING" or s.get("quoteAsset") != "USDT":
-            continue
-        if s.get("contractType") and s["contractType"] != "PERPETUAL":
-            continue
-        sym = s.get("symbol", "")
-        if not sym.endswith("USDT") or "_" in sym or sym in EXCLUDE_EXACT or sym.endswith(EXCLUDE_SUFFIXES):
-            continue
-        valid.add(sym)
-    tickers = get_json(BINANCE + "/fapi/v1/ticker/24hr")
+
+def bybit_universe():
+    """Build USDT perpetual universe from Bybit, ranked by 24h turnover."""
+    supported = bybit_symbols()
+
+    data = get_json(
+        BYBIT + "/v5/market/tickers",
+        {"category": "linear"}
+    )
+    if data.get("retCode") != 0:
+        raise RuntimeError(
+            "Bybit tickers: " + str(data.get("retMsg"))
+        )
+
     items = []
-    for t in tickers:
-        sym = t.get("symbol")
-        try: vol = float(t.get("quoteVolume", 0))
-        except (TypeError, ValueError): continue
-        if sym in valid and vol > 0:
-            items.append((sym, vol))
+    for ticker in data.get("result", {}).get("list", []):
+        sym = ticker.get("symbol", "")
+        if sym not in supported:
+            continue
+        if sym in EXCLUDE_EXACT or sym.endswith(EXCLUDE_SUFFIXES):
+            continue
+
+        try:
+            turnover = float(ticker.get("turnover24h", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if turnover > 0:
+            items.append((sym, turnover))
+
     items.sort(key=lambda x: x[1], reverse=True)
     return items[:TOP_UNIVERSE]
 
@@ -86,33 +96,103 @@ def wilder_atr(highs, lows, closes, period=14):
     return atr
 
 
+
 def build_stable_universe():
-    items = binance_universe()
-    btc_kl = get_json(BINANCE + "/fapi/v1/klines", {"symbol":"BTCUSDT", "interval":"1d", "limit":120})
+    """Apply the original stability and ATR filters using Bybit data."""
+    items = bybit_universe()
+
+    btc_data = get_json(
+        BYBIT + "/v5/market/kline",
+        {
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "interval": "D",
+            "limit": 120
+        }
+    )
+
+    if btc_data.get("retCode") != 0:
+        raise RuntimeError(
+            "Bybit BTC daily candles: " + str(btc_data.get("retMsg"))
+        )
+
+    btc_kl = list(reversed(
+        btc_data.get("result", {}).get("list", [])
+    ))
+
     btc_map = daily_returns(btc_kl)
     btc_sigma = stdev(list(btc_map.values()))
+
     stable = []
-    # Only top 200 can pass original STABLE.topN condition; all are checked in volume rank order.
+
     for rank, (sym, quote_volume) in enumerate(items):
         try:
-            kl = get_json(BINANCE + "/fapi/v1/klines", {"symbol":sym, "interval":"1d", "limit":120})
-            if len(kl) < 90: continue
-            highs = [float(k[2]) for k in kl]; lows = [float(k[3]) for k in kl]; closes = [float(k[4]) for k in kl]
-            atr = wilder_atr(highs[:-1], lows[:-1], closes[:-1], 14)
-            if not atr or closes[-1] <= 0: continue
+            data = get_json(
+                BYBIT + "/v5/market/kline",
+                {
+                    "category": "linear",
+                    "symbol": sym,
+                    "interval": "D",
+                    "limit": 120
+                }
+            )
+
+            if data.get("retCode") != 0:
+                raise RuntimeError(str(data.get("retMsg")))
+
+            kl = list(reversed(
+                data.get("result", {}).get("list", [])
+            ))
+
+            if len(kl) < 90:
+                continue
+
+            highs = [float(k[2]) for k in kl]
+            lows = [float(k[3]) for k in kl]
+            closes = [float(k[4]) for k in kl]
+
+            atr = wilder_atr(
+                highs[:-1], lows[:-1], closes[:-1], 14
+            )
+
+            if not atr or closes[-1] <= 0:
+                continue
+
             atr_pct = atr / closes[-1] * 100
-            rets = daily_returns(kl); own = list(rets.values())
-            if not own: continue
-            shared = [(v, btc_map[t]) for t,v in rets.items() if t in btc_map]
-            aa = [x[0] for x in shared]; bb = [x[1] for x in shared]
-            sigma = stdev(own); max_move = max(abs(x) for x in own); correlation = corr(aa,bb) if len(aa)>=30 else 0
-            is_stable = (rank < 200 and sigma <= 2*btc_sigma and max_move <= 5*btc_sigma and correlation >= 0.6)
+            rets = daily_returns(kl)
+            own = list(rets.values())
+
+            if not own:
+                continue
+
+            shared = [
+                (v, btc_map[t])
+                for t, v in rets.items()
+                if t in btc_map
+            ]
+
+            aa = [x[0] for x in shared]
+            bb = [x[1] for x in shared]
+
+            sigma = stdev(own)
+            max_move = max(abs(x) for x in own)
+            correlation = corr(aa, bb) if len(aa) >= 30 else 0
+
+            is_stable = (
+                rank < 200
+                and sigma <= 2 * btc_sigma
+                and max_move <= 5 * btc_sigma
+                and correlation >= 0.6
+            )
+
             if is_stable and atr_pct <= 4:
                 stable.append((sym, quote_volume, atr_pct))
+
         except Exception as e:
-            print(f"[WARN] Binance daily {sym}: {e}", flush=True)
-        # Keep API request rate moderate.
-        time.sleep(0.06)
+            print(f"[WARN] Bybit daily {sym}: {e}", flush=True)
+
+        time.sleep(0.08)
+
     return stable[:MAX_MONITORED]
 
 
