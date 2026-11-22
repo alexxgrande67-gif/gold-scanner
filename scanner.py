@@ -934,3 +934,5 @@ def main():
         f"exchange={exchange}",
         flush=True
     )
+if __name__ == "__main__":
+    main()
