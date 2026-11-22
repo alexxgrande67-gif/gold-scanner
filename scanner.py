@@ -789,18 +789,14 @@ def main():
     state = load_state()
     seen = set(state.get("seen", []))
     seeded = set(state.get("seeded_symbols", []))
+
     discovered = []
-    all_keys = []
+    seed_keys = []
 
     for idx, (sym, vol, _) in enumerate(symbols, 1):
         try:
-            days_raw = get_bars(
-                exchange, sym, "1d", 700
-            )
-
-            m5_raw = get_bars(
-                exchange, sym, "5m", 1000
-            )
+            days_raw = get_bars(exchange, sym, "1d", 700)
+            m5_raw = get_bars(exchange, sym, "5m", 1000)
 
             days = [
                 {
@@ -834,7 +830,6 @@ def main():
                 )
                 continue
 
-            # ATR is informational only; it does not filter symbols.
             highs = [d["high"] for d in days[:-1]]
             lows = [d["low"] for d in days[:-1]]
             closes = [d["close"] for d in days[:-1]]
@@ -860,11 +855,12 @@ def main():
                     f"{event['price']:.12g}|{event['touch']}"
                 )
 
-                all_keys.append(key)
+                if is_new_symbol:
+                    seed_keys.append(key)
 
-                if key not in seen and not is_new_symbol:
+                elif key not in seen:
                     discovered.append(
-                        (sym, event, atr_pct, vol, key)
+                        (sym, event, atr_pct, key)
                     )
 
             if is_new_symbol:
@@ -886,16 +882,19 @@ def main():
 
     if not state.get("primed"):
         state["primed"] = True
-
         print(
-            "Initial run: historical signals seeded; "
-            "no old alerts sent.",
+            "Initial run: historical signals seeded; no old alerts sent.",
             flush=True
         )
 
-    for sym, event, atr_pct, vol, key in discovered:
-        seen.add(key)
+    # Исторические события новых монет не отправляем.
+    seen.update(seed_keys)
 
+    # Отправляем только новые сигналы.
+    sent_count = 0
+    failed_count = 0
+
+    for sym, event, atr_pct, key in discovered:
         side = (
             "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ"
             if event["side"] == "H"
@@ -914,12 +913,14 @@ def main():
             flush=True
         )
 
-    for key in all_keys:
-        if key.split("|", 1)[0] in seeded:
+        if send_telegram(sym, event, atr_pct):
             seen.add(key)
+            sent_count += 1
+        else:
+            failed_count += 1
 
     state["seeded_symbols"] = sorted(seeded)
-    state["seen"] = list(seen)[-10000:]
+    state["seen"] = sorted(seen)[-10000:]
 
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n"
@@ -927,19 +928,9 @@ def main():
 
     print(
         f"GOLD SCANNER: finished; "
-        f"new candidates={len(discovered) if state.get('primed') else 0}; "
+        f"new candidates={len(discovered)}; "
+        f"telegram sent={sent_count}; "
+        f"telegram failed={failed_count}; "
         f"exchange={exchange}",
         flush=True
     )
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(
-            f"FATAL: {exc}",
-            file=sys.stderr,
-            flush=True
-        )
-        raise
