@@ -1,5 +1,17 @@
 {
-  "primed": false,
+  "primed": true,
   "seen": [],
-  "seeded_symbols": []
+  "seeded_symbols": [
+    "AAPLUSDT",
+    "AMZNUSDT",
+    "BZUSDT",
+    "CLUSDT",
+    "COSTUSDT",
+    "MSFTUSDT",
+    "NGUSDT",
+    "QQQUSDT",
+    "SPYUSDT",
+    "TRXUSDT",
+    "XAUUSDT"
+  ]
 }
