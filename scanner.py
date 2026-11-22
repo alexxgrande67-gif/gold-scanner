@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Original false-breakout engine with OKX/Gate.io data."""
 from __future__ import annotations
 
@@ -236,12 +236,11 @@ def build_stable_universe():
             sigma = stdev(own)
             max_move = max(abs(x) for x in own)
             correlation = corr(aa, bb) if len(aa) >= 30 else 0
-            is_stable = (
-                rank < 200 and sigma <= 2 * btc_sigma
-                and max_move <= 5 * btc_sigma and correlation >= 0.6
-            )
-            if is_stable and atr_pct <= 4:
-                stable.append((sym, quote_volume, atr_pct))
+            # Фильтр стабильности относительно BTC отключён
+is_stable = rank < 200
+
+if is_stable and atr_pct <= 4:
+    stable.append((sym, quote_volume, atr_pct))
         except Exception as exc:
             print(f"[WARN] {ACTIVE_EXCHANGE} daily {sym}: {exc}", flush=True)
         time.sleep(0.06)
