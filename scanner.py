@@ -767,10 +767,55 @@ def send_telegram(sym, event, atr_pct):
         )
         return False
 
+def send_telegram_test():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("[TELEGRAM TEST] Missing bot token or chat ID", flush=True)
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    message = (
+        "🟡 <b>GOLD SCANNER — ТЕСТ УВЕДОМЛЕНИЯ</b>\n\n"
+        "Telegram успешно подключён!\n"
+        "Бот может отправлять уведомления.\n\n"
+        "Это проверочное сообщение, не торговый сигнал."
+    )
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=15
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("ok") is True:
+            print("[TELEGRAM TEST] Message sent successfully", flush=True)
+            return True
+
+        print(f"[TELEGRAM TEST] API error: {result}", flush=True)
+        return False
+
+    except Exception as exc:
+        print(f"[TELEGRAM TEST] Failed: {exc}", flush=True)
+        return False
+        
 def main():
     global ACTIVE_EXCHANGE
 
     print("GOLD SCANNER: start", flush=True)
+        if os.getenv("TELEGRAM_TEST") == "1":
+        send_telegram_test()
 
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
