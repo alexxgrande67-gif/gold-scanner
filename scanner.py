@@ -16,8 +16,10 @@ OKX = "https://www.okx.com"
 GATE = "https://api.gateio.ws/api/v4"
 STATE_FILE = Path("state.json")
 FB = {"swing": 12, "minSwingAtr": 2.5, "mergeAtr": 0.5, "leaveAtr": 0.5}
-TOP_UNIVERSE = 200
-MAX_MONITORED = int(os.getenv("MAX_MONITORED", "100"))
+
+# Expanded universe and monitoring capacity
+TOP_UNIVERSE = 500
+MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
 EXCLUDE_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "GBP", "AEUR",
