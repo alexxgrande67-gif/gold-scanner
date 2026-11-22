@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import html
 import math
 import os
 import sys
