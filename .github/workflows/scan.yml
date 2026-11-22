@@ -4,6 +4,7 @@ name: GOLD SCANNER - every 5 minutes
 on:
   schedule:
     - cron: '2-57/5 * * * *'
+
   workflow_dispatch:
     inputs:
       telegram_test:
@@ -23,6 +24,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -41,6 +43,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TEST: ${{ inputs.telegram_test && '1' || '0' }}
         run: python scanner.py
 
       - name: Save signal de-duplication state
