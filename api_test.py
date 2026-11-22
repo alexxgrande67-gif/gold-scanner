@@ -1,41 +1,32 @@
 
 import requests
-from datetime import datetime, timezone
 
 URLS = {
-    "Bybit server time":
-        "https://api.bybit.com/v5/market/time",
+    "OKX instruments":
+        "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
 
-    "Bybit instruments":
-        "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=10",
+    "OKX BTC 5m candles":
+        "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=5m&limit=2",
 
-    "Binance futures server time":
-        "https://fapi.binance.com/fapi/v1/time",
+    "Gate instruments":
+        "https://api.gateio.ws/api/v4/futures/usdt/contracts",
 
-    "Binance futures instruments":
-        "https://fapi.binance.com/fapi/v1/exchangeInfo",
-}
-
-print("GOLD SCANNER API DIAGNOSTICS")
-print("UTC:", datetime.now(timezone.utc).isoformat())
-
-headers = {
-    "User-Agent": "Mozilla/5.0 GOLD-SCANNER/1.0",
-    "Accept": "application/json",
+    "Gate BTC 5m candles":
+        "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=5m&limit=2",
 }
 
 for name, url in URLS.items():
     print("\n" + "=" * 45)
     print(name)
     try:
-        response = requests.get(
+        r = requests.get(
             url,
-            headers=headers,
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=20
         )
-        print("HTTP:", response.status_code)
-        print("Response:", response.text[:500])
-    except Exception as error:
-        print("ERROR:", repr(error))
+        print("HTTP:", r.status_code)
+        print("Response:", r.text[:700])
+    except Exception as e:
+        print("ERROR:", repr(e))
 
-print("\nDIAGNOSTICS FINISHED")
+print("\nTEST FINISHED")
