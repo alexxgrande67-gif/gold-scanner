@@ -25,6 +25,17 @@ GATE = "https://api.gateio.ws/api/v4"
 
 STATE_FILE = Path("state.json")
 
+# Daily candles cache
+DAILY_CACHE_FILE = Path("daily_cache.json")
+DAILY_CACHE_VERSION = 1
+
+_daily_cache = {
+    "version": DAILY_CACHE_VERSION,
+    "exchange": None,
+    "symbols": {}
+}
+_daily_cache_lock = threading.Lock()
+
 # False-breakout parameters
 FB = {
     "swing": 1,
@@ -36,7 +47,6 @@ FB = {
 TOP_UNIVERSE = 500
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
-# Parallel workers. Keep this moderate to avoid exchange limits.
 SCAN_WORKERS = max(
     1,
     min(int(os.getenv("SCAN_WORKERS", "5")), 10)
@@ -44,8 +54,6 @@ SCAN_WORKERS = max(
 
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 25
-
-# Minimum spacing between outgoing market-data requests.
 REQUEST_INTERVAL = 0.06
 
 EXCLUDE_BASES = {
@@ -65,13 +73,10 @@ _last_request_time = 0.0
 # ============================================================
 
 def get_session():
-    """Return one requests session per worker thread."""
-
     session = getattr(_thread_local, "session", None)
 
     if session is None:
         session = requests.Session()
-
         session.headers.update({
             "User-Agent": "GOLD-SCANNER/1.0",
             "Accept": "application/json"
@@ -85,15 +90,12 @@ def get_session():
 
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-
         _thread_local.session = session
 
     return session
 
 
 def request_spacing():
-    """Apply a small global delay between market-data requests."""
-
     global _last_request_time
 
     with _request_lock:
@@ -107,8 +109,6 @@ def request_spacing():
 
 
 def get_json(url: str, params: dict | None = None, timeout: int = HTTP_TIMEOUT):
-    """GET JSON with retry handling for transient network errors."""
-
     last_error = None
 
     for attempt in range(1, HTTP_RETRIES + 1):
@@ -124,15 +124,11 @@ def get_json(url: str, params: dict | None = None, timeout: int = HTTP_TIMEOUT):
             response.raise_for_status()
             return response.json()
 
-        except (
-            requests.RequestException,
-            ValueError
-        ) as exc:
+        except (requests.RequestException, ValueError) as exc:
             last_error = exc
 
             if attempt < HTTP_RETRIES:
-                delay = min(1.0 * attempt, 3.0)
-                time.sleep(delay)
+                time.sleep(min(1.0 * attempt, 3.0))
 
     raise RuntimeError(
         f"HTTP request failed after {HTTP_RETRIES} attempts: "
@@ -299,11 +295,7 @@ def _okx_universe():
         if turnover > 0:
             items.append((sym, turnover))
 
-    items.sort(
-        key=lambda x: x[1],
-        reverse=True
-    )
-
+    items.sort(key=lambda x: x[1], reverse=True)
     return items[:TOP_UNIVERSE]
 
 
@@ -346,11 +338,7 @@ def _gate_universe():
         if turnover > 0:
             items.append((sym, turnover))
 
-    items.sort(
-        key=lambda x: x[1],
-        reverse=True
-    )
-
+    items.sort(key=lambda x: x[1], reverse=True)
     return items[:TOP_UNIVERSE]
 
 
@@ -457,9 +445,7 @@ def wilder_atr(highs, lows, closes, period=14):
     atr = sum(trs[:period]) / period
 
     for tr in trs[period:]:
-        atr = (
-            (atr * (period - 1) + tr) / period
-        )
+        atr = (atr * (period - 1) + tr) / period
 
     return atr
 
@@ -474,7 +460,6 @@ def _normalise_rows(rows, source):
     for row in rows:
         if source == "okx":
             ts, op, hi, lo, cl, vol = row[:6]
-
         else:
             ts, op, hi, lo, cl, vol = (
                 row["t"],
@@ -504,11 +489,7 @@ def get_bars(exchange, symbol, interval, limit):
             "-USDT-SWAP"
         )
 
-        bar = (
-            "5m"
-            if interval == "5m"
-            else "1D"
-        )
+        bar = "5m" if interval == "5m" else "1D"
 
         rows = _okx_rows(
             inst_id,
@@ -519,12 +500,7 @@ def get_bars(exchange, symbol, interval, limit):
         return _normalise_rows(rows, "okx")
 
     contract = _base(symbol) + "_USDT"
-
-    gate_interval = (
-        "5m"
-        if interval == "5m"
-        else "1d"
-    )
+    gate_interval = "5m" if interval == "5m" else "1d"
 
     rows = _gate_rows(
         contract,
@@ -535,18 +511,176 @@ def get_bars(exchange, symbol, interval, limit):
     return _normalise_rows(rows, "gate")
 
 
-def _daily_rows(symbol: str, limit: int):
-    if ACTIVE_EXCHANGE == "okx":
-        return _okx_rows(
-            symbol.replace("USDT", "-USDT-SWAP"),
-            "1D",
-            limit
+# ============================================================
+# DAILY CANDLES CACHE
+# ============================================================
+
+def load_daily_cache(exchange):
+    global _daily_cache
+
+    if not DAILY_CACHE_FILE.exists():
+        print(
+            "[CACHE] daily_cache.json not found; "
+            "full daily history will be downloaded.",
+            flush=True
+        )
+        _daily_cache = {
+            "version": DAILY_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+        return
+
+    try:
+        data = json.loads(
+            DAILY_CACHE_FILE.read_text(encoding="utf-8")
         )
 
-    return _gate_rows(
-        _base(symbol) + "_USDT",
-        "1d",
-        limit
+        if (
+            data.get("version") != DAILY_CACHE_VERSION
+            or data.get("exchange") != exchange
+            or not isinstance(data.get("symbols"), dict)
+        ):
+            print(
+                "[CACHE] Cache version or exchange mismatch; "
+                "starting with an empty cache.",
+                flush=True
+            )
+            _daily_cache = {
+                "version": DAILY_CACHE_VERSION,
+                "exchange": exchange,
+                "symbols": {}
+            }
+            return
+
+        valid_symbols = {}
+
+        for symbol, rows in data["symbols"].items():
+            if not isinstance(rows, list):
+                continue
+
+            valid_rows = []
+
+            for row in rows:
+                try:
+                    if len(row) < 6:
+                        continue
+
+                    valid_rows.append([
+                        int(row[0]),
+                        float(row[1]),
+                        float(row[2]),
+                        float(row[3]),
+                        float(row[4]),
+                        float(row[5])
+                    ])
+                except (TypeError, ValueError):
+                    continue
+
+            valid_rows.sort(key=lambda x: x[0])
+
+            if valid_rows:
+                valid_symbols[symbol] = valid_rows[-700:]
+
+        _daily_cache = {
+            "version": DAILY_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": valid_symbols
+        }
+
+        print(
+            f"[CACHE] Loaded daily history for "
+            f"{len(valid_symbols)} symbols.",
+            flush=True
+        )
+
+    except Exception as exc:
+        print(
+            f"[CACHE] Cannot read daily cache: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
+
+        _daily_cache = {
+            "version": DAILY_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+
+
+def get_cached_daily_bars(exchange, symbol):
+    with _daily_cache_lock:
+        cached = _daily_cache["symbols"].get(symbol, [])
+        cached = [row[:] for row in cached]
+
+    download_limit = 30 if cached else 700
+
+    try:
+        fresh = get_bars(
+            exchange,
+            symbol,
+            "1d",
+            download_limit
+        )
+
+        merged = {
+            int(row[0]): row
+            for row in cached
+        }
+
+        for row in fresh:
+            merged[int(row[0])] = row
+
+        result = [
+            merged[ts]
+            for ts in sorted(merged)
+        ][-700:]
+
+        with _daily_cache_lock:
+            _daily_cache["symbols"][symbol] = result
+
+        return result
+
+    except Exception as exc:
+        if len(cached) >= 60:
+            print(
+                f"[CACHE] {symbol}: daily refresh failed; "
+                f"using cached history. "
+                f"{type(exc).__name__}: {exc}",
+                flush=True
+            )
+            return cached
+
+        raise
+
+
+def save_daily_cache():
+    with _daily_cache_lock:
+        data = {
+            "version": DAILY_CACHE_VERSION,
+            "exchange": _daily_cache["exchange"],
+            "symbols": _daily_cache["symbols"]
+        }
+
+        serialized = json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+    temp_file = DAILY_CACHE_FILE.with_suffix(".tmp")
+
+    temp_file.write_text(
+        serialized,
+        encoding="utf-8"
+    )
+
+    temp_file.replace(DAILY_CACHE_FILE)
+
+    print(
+        f"[CACHE] Saved daily history for "
+        f"{len(data['symbols'])} symbols.",
+        flush=True
     )
 
 
@@ -576,7 +710,6 @@ def atr_series(days, period=14):
             if i == period - 1:
                 prev = total / period
                 out[i] = prev
-
         else:
             prev = (
                 prev * (period - 1) + tr
@@ -732,7 +865,6 @@ def fb_compute(days, m5, now_ms=None):
         )
 
         i_start = k if k >= 0 else n
-
     else:
         i_start = n
 
@@ -898,9 +1030,7 @@ def telegram_post(message, timeout=20):
         )
         return False
 
-    url = (
-        f"https://api.telegram.org/bot{token}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
         response = requests.post(
@@ -1018,11 +1148,9 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
     """
 
     try:
-        days_raw = get_bars(
+        days_raw = get_cached_daily_bars(
             exchange,
-            sym,
-            "1d",
-            700
+            sym
         )
 
         m5_raw = get_bars(
@@ -1156,8 +1284,6 @@ def main():
         flush=True
     )
 
-    # Test is sent only on manual workflow run
-    # when TELEGRAM_TEST=1.
     if os.getenv("TELEGRAM_TEST") == "1":
         test_ok = send_telegram_test()
 
@@ -1173,6 +1299,9 @@ def main():
 
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
+
+    # Load daily candle cache for the selected exchange.
+    load_daily_cache(exchange)
 
     print(
         f"Universe selected: {len(symbols)} symbols; "
@@ -1196,7 +1325,6 @@ def main():
         state.get("seeded_symbols", [])
     )
 
-    # Snapshot is read-only for worker threads.
     seen_snapshot = frozenset(seen)
 
     discovered = []
@@ -1257,7 +1385,6 @@ def main():
                         symbol_seed_keys
                     )
 
-                    # Mark only successfully scanned symbols as seeded.
                     seeded.add(result_sym)
 
                 else:
@@ -1288,6 +1415,9 @@ def main():
                     flush=True
                 )
 
+    # Save updated daily cache after all workers have finished.
+    save_daily_cache()
+
     if not state.get("primed"):
         state["primed"] = True
 
@@ -1297,7 +1427,6 @@ def main():
             flush=True
         )
 
-    # Historical events of newly monitored symbols are not sent.
     seen.update(seed_keys)
 
     sent_count = 0
@@ -1307,10 +1436,6 @@ def main():
         f"[INFO] New signal candidates: {len(discovered)}",
         flush=True
     )
-
-    # ========================================================
-    # NEW: chronological sorting (oldest first, newest last)
-    # ========================================================
 
     discovered.sort(
         key=lambda item: item[1]["touch"]
@@ -1341,8 +1466,6 @@ def main():
             sent_count += 1
 
         else:
-            # Do not add failed notifications to seen.
-            # They can be retried on the next scheduled scan.
             failed_count += 1
 
     state["seeded_symbols"] = sorted(seeded)
