@@ -3,7 +3,7 @@ name: GOLD SCANNER - every 5 minutes
 
 on:
   schedule:
-    - cron: '2-57/5 * * * *'
+    - cron: '2-58/7 * * * *'
 
   workflow_dispatch:
     inputs:
