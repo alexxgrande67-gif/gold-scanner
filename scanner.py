@@ -26,6 +26,7 @@ GATE = "https://api.gateio.ws/api/v4"
 
 STATE_FILE = Path("state.json")
 
+# False-breakout parameters
 FB = {
     "swing": 1,
     "minSwingAtr": 1,
@@ -36,6 +37,7 @@ FB = {
 TOP_UNIVERSE = 500
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
+# Parallel workers. Keep this moderate to avoid exchange limits.
 SCAN_WORKERS = max(
     1,
     min(int(os.getenv("SCAN_WORKERS", "5")), 10)
@@ -44,10 +46,8 @@ SCAN_WORKERS = max(
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 25
 
+# Minimum spacing between outgoing market-data requests.
 REQUEST_INTERVAL = 0.06
-
-# Send only signals triggered within the last 60 minutes.
-MAX_ALERT_AGE_SECONDS = 60 * 60
 
 EXCLUDE_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "GBP",
@@ -66,6 +66,8 @@ _last_request_time = 0.0
 # ============================================================
 
 def get_session():
+    """Return one requests session per worker thread."""
+
     session = getattr(_thread_local, "session", None)
 
     if session is None:
@@ -91,6 +93,8 @@ def get_session():
 
 
 def request_spacing():
+    """Apply a small global delay between market-data requests."""
+
     global _last_request_time
 
     with _request_lock:
@@ -103,8 +107,8 @@ def request_spacing():
         _last_request_time = time.monotonic()
 
 
-def get_json(url: str, params: dict | None = None,
-             timeout: int = HTTP_TIMEOUT):
+def get_json(url: str, params: dict | None = None, timeout: int = HTTP_TIMEOUT):
+    """GET JSON with retry handling for transient network errors."""
 
     last_error = None
 
@@ -121,11 +125,15 @@ def get_json(url: str, params: dict | None = None,
             response.raise_for_status()
             return response.json()
 
-        except (requests.RequestException, ValueError) as exc:
+        except (
+            requests.RequestException,
+            ValueError
+        ) as exc:
             last_error = exc
 
             if attempt < HTTP_RETRIES:
-                time.sleep(min(1.0 * attempt, 3.0))
+                delay = min(1.0 * attempt, 3.0)
+                time.sleep(delay)
 
     raise RuntimeError(
         f"HTTP request failed after {HTTP_RETRIES} attempts: "
@@ -292,7 +300,10 @@ def _okx_universe():
         if turnover > 0:
             items.append((sym, turnover))
 
-    items.sort(key=lambda x: x[1], reverse=True)
+    items.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
 
     return items[:TOP_UNIVERSE]
 
@@ -336,7 +347,10 @@ def _gate_universe():
         if turnover > 0:
             items.append((sym, turnover))
 
-    items.sort(key=lambda x: x[1], reverse=True)
+    items.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
 
     return items[:TOP_UNIVERSE]
 
@@ -444,7 +458,9 @@ def wilder_atr(highs, lows, closes, period=14):
     atr = sum(trs[:period]) / period
 
     for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
+        atr = (
+            (atr * (period - 1) + tr) / period
+        )
 
     return atr
 
@@ -489,19 +505,50 @@ def get_bars(exchange, symbol, interval, limit):
             "-USDT-SWAP"
         )
 
-        bar = "5m" if interval == "5m" else "1D"
+        bar = (
+            "5m"
+            if interval == "5m"
+            else "1D"
+        )
 
-        rows = _okx_rows(inst_id, bar, limit)
+        rows = _okx_rows(
+            inst_id,
+            bar,
+            limit
+        )
 
         return _normalise_rows(rows, "okx")
 
     contract = _base(symbol) + "_USDT"
 
-    gate_interval = "5m" if interval == "5m" else "1d"
+    gate_interval = (
+        "5m"
+        if interval == "5m"
+        else "1d"
+    )
 
-    rows = _gate_rows(contract, gate_interval, limit)
+    rows = _gate_rows(
+        contract,
+        gate_interval,
+        limit
+    )
 
     return _normalise_rows(rows, "gate")
+
+
+def _daily_rows(symbol: str, limit: int):
+    if ACTIVE_EXCHANGE == "okx":
+        return _okx_rows(
+            symbol.replace("USDT", "-USDT-SWAP"),
+            "1D",
+            limit
+        )
+
+    return _gate_rows(
+        _base(symbol) + "_USDT",
+        "1d",
+        limit
+    )
 
 
 # ============================================================
@@ -532,7 +579,10 @@ def atr_series(days, period=14):
                 out[i] = prev
 
         else:
-            prev = (prev * (period - 1) + tr) / period
+            prev = (
+                prev * (period - 1) + tr
+            ) / period
+
             out[i] = prev
 
     return out
@@ -630,7 +680,10 @@ def fb_compute(days, m5, now_ms=None):
     L = FB["swing"]
 
     if n < L * 2 + 20:
-        return {"levels": [], "events": []}
+        return {
+            "levels": [],
+            "events": []
+        }
 
     ev, atr = fb_events(days)
 
@@ -672,7 +725,10 @@ def fb_compute(days, m5, now_ms=None):
         ) * 86400
 
         k = next(
-            (i for i, d in enumerate(days) if d["time"] >= ds),
+            (
+                i for i, d in enumerate(days)
+                if d["time"] >= ds
+            ),
             -1
         )
 
@@ -772,6 +828,7 @@ def fb_compute(days, m5, now_ms=None):
                     "side": "L",
                     "price": x["price"],
                     "time": x["time"],
+                    # Fixed: required by deduplication and Telegram.
                     "touch": b["time"]
                 })
 
@@ -789,8 +846,15 @@ def fb_compute(days, m5, now_ms=None):
                 gone = True
 
         if gone:
-            H = [x for x in H if x["st"] != 2]
-            Lo = [x for x in Lo if x["st"] != 2]
+            H = [
+                x for x in H
+                if x["st"] != 2
+            ]
+
+            Lo = [
+                x for x in Lo
+                if x["st"] != 2
+            ]
 
     return {
         "levels": H + Lo,
@@ -805,7 +869,9 @@ def fb_compute(days, m5, now_ms=None):
 def load_state():
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            return json.loads(
+                STATE_FILE.read_text()
+            )
         except Exception as exc:
             print(
                 f"[WARN] Cannot read state.json: {exc}",
@@ -834,7 +900,9 @@ def telegram_post(message, timeout=20):
         )
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = (
+        f"https://api.telegram.org/bot{token}/sendMessage"
+    )
 
     try:
         response = requests.post(
@@ -944,9 +1012,27 @@ def send_telegram_test():
 # ============================================================
 
 def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
+    """
+    Process one symbol independently.
+
+    Returns:
+        symbol, discovered events, seed keys, success, error
+    """
+
     try:
-        days_raw = get_bars(exchange, sym, "1d", 700)
-        m5_raw = get_bars(exchange, sym, "5m", 1000)
+        days_raw = get_bars(
+            exchange,
+            sym,
+            "1d",
+            700
+        )
+
+        m5_raw = get_bars(
+            exchange,
+            sym,
+            "5m",
+            1000
+        )
 
         days = [
             {
@@ -974,17 +1060,34 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
 
         if len(days) < 60 or len(m5) < 30:
             return (
-                sym, [], [], False,
+                sym,
+                [],
+                [],
+                False,
                 f"insufficient candle history "
                 f"(daily={len(days)}, 5m={len(m5)})"
             )
 
-        highs = [d["high"] for d in days[:-1]]
-        lows = [d["low"] for d in days[:-1]]
-        closes = [d["close"] for d in days[:-1]]
+        highs = [
+            d["high"]
+            for d in days[:-1]
+        ]
+
+        lows = [
+            d["low"]
+            for d in days[:-1]
+        ]
+
+        closes = [
+            d["close"]
+            for d in days[:-1]
+        ]
 
         atr_value = wilder_atr(
-            highs, lows, closes, 14
+            highs,
+            lows,
+            closes,
+            14
         )
 
         last_close = days[-1]["close"]
@@ -1041,21 +1144,26 @@ def main():
 
     started_at = time.time()
 
-    print("GOLD SCANNER: start", flush=True)
+    print(
+        "GOLD SCANNER: start",
+        flush=True
+    )
 
     print(
         f"[CONFIG] swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
-        f"http_retries={HTTP_RETRIES}; "
-        f"max_alert_age={MAX_ALERT_AGE_SECONDS // 60} minutes",
+        f"http_retries={HTTP_RETRIES}",
         flush=True
     )
 
-    # Test only on manual workflow run with TELEGRAM_TEST=1.
+    # Test is sent only on manual workflow run
+    # when TELEGRAM_TEST=1.
     if os.getenv("TELEGRAM_TEST") == "1":
-        if not send_telegram_test():
+        test_ok = send_telegram_test()
+
+        if not test_ok:
             raise RuntimeError(
                 "Telegram test message was not delivered"
             )
@@ -1082,9 +1190,15 @@ def main():
 
     state = load_state()
 
-    seen = set(state.get("seen", []))
-    seeded = set(state.get("seeded_symbols", []))
+    seen = set(
+        state.get("seen", [])
+    )
 
+    seeded = set(
+        state.get("seeded_symbols", [])
+    )
+
+    # Snapshot is read-only for worker threads.
     seen_snapshot = frozenset(seen)
 
     discovered = []
@@ -1137,9 +1251,15 @@ def main():
                 if success:
                     successful_symbols += 1
 
-                    discovered.extend(symbol_events)
-                    seed_keys.extend(symbol_seed_keys)
+                    discovered.extend(
+                        symbol_events
+                    )
 
+                    seed_keys.extend(
+                        symbol_seed_keys
+                    )
+
+                    # Mark only successfully scanned symbols as seeded.
                     seeded.add(result_sym)
 
                 else:
@@ -1159,7 +1279,10 @@ def main():
                     flush=True
                 )
 
-            if completed % 10 == 0 or completed == total:
+            if (
+                completed % 10 == 0
+                or completed == total
+            ):
                 print(
                     f"Progress: {completed}/{total}; "
                     f"successful={successful_symbols}; "
@@ -1179,81 +1302,15 @@ def main():
     # Historical events of newly monitored symbols are not sent.
     seen.update(seed_keys)
 
-    # ========================================================
-    # FILTER BY ACTUAL SIGNAL TRIGGER TIME
-    # ========================================================
-
-    now_sec = int(time.time())
-
-    fresh_discovered = []
-    stale_count = 0
-    future_count = 0
-
-    for item in discovered:
-        sym, event, atr_pct, key = item
-
-        event_time = int(event["touch"])
-        age_seconds = now_sec - event_time
-
-        # Older than one hour: permanently mark as processed.
-        if age_seconds > MAX_ALERT_AGE_SECONDS:
-            seen.add(key)
-            stale_count += 1
-            continue
-
-        # Future timestamps are not sent or marked as seen.
-        if age_seconds < 0:
-            future_count += 1
-            continue
-
-        fresh_discovered.append(item)
-
-    # Oldest eligible signal first; newest eligible signal last.
-    fresh_discovered.sort(
-        key=lambda item: (
-            int(item[1]["touch"]),
-            item[0]
-        )
-    )
-
-    print(
-        f"[INFO] Signal candidates={len(discovered)}; "
-        f"fresh={len(fresh_discovered)}; "
-        f"stale skipped={stale_count}; "
-        f"future skipped={future_count}",
-        flush=True
-    )
-
-    # ========================================================
-    # SEND FRESH SIGNALS IN CHRONOLOGICAL ORDER
-    # ========================================================
-
     sent_count = 0
     failed_count = 0
 
-    for sym, event, atr_pct, key in fresh_discovered:
+    print(
+        f"[INFO] New signal candidates: {len(discovered)}",
+        flush=True
+    )
 
-        # Check age again immediately before sending.
-        # This prevents a signal from being sent if it becomes
-        # older than one hour while waiting in the queue.
-        current_time = int(time.time())
-        age_seconds = current_time - int(event["touch"])
-
-        if age_seconds > MAX_ALERT_AGE_SECONDS:
-            seen.add(key)
-            stale_count += 1
-
-            print(
-                f"[SKIP OLD] {sym}: signal age "
-                f"{age_seconds // 60} minutes",
-                flush=True
-            )
-            continue
-
-        if age_seconds < 0:
-            future_count += 1
-            continue
-
+    for sym, event, atr_pct, key in discovered:
         side = (
             "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ"
             if event["side"] == "H"
@@ -1269,7 +1326,6 @@ def main():
             f"SIGNAL | {sym} | {side} | "
             f"level={event['price']} | "
             f"candle={dt} | "
-            f"age={age_seconds // 60}m | "
             f"ATR%={atr_pct:.2f}",
             flush=True
         )
@@ -1277,14 +1333,11 @@ def main():
         if send_telegram(sym, event, atr_pct):
             seen.add(key)
             sent_count += 1
-        else:
-            # Failed messages can be retried on the next run,
-            # but only if they are still within the one-hour limit.
-            failed_count += 1
 
-    # ========================================================
-    # SAVE STATE
-    # ========================================================
+        else:
+            # Do not add failed notifications to seen.
+            # They can be retried on the next scheduled scan.
+            failed_count += 1
 
     state["seeded_symbols"] = sorted(seeded)
     state["seen"] = sorted(seen)[-10000:]
@@ -1304,8 +1357,6 @@ def main():
         f"scanned={successful_symbols}; "
         f"symbol errors={failed_symbols}; "
         f"new candidates={len(discovered)}; "
-        f"fresh candidates={len(fresh_discovered)}; "
-        f"stale skipped={stale_count}; "
         f"telegram sent={sent_count}; "
         f"telegram failed={failed_count}; "
         f"exchange={exchange}; "
