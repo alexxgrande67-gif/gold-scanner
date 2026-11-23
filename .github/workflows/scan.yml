@@ -1,3 +1,4 @@
+
 name: GOLD SCANNER - external and manual запуск
 
 on:
@@ -42,12 +43,20 @@ jobs:
           MAX_MONITORED: '500'
         run: python scanner.py
 
-      - name: Save signal de-duplication state
+      - name: Save scanner state and daily cache
         run: |
-          if ! git diff --quiet -- state.json; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add state.json
-            git commit -m "Update scanner state [skip ci]"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state.json
+
+          if [ -f daily_cache.json ]; then
+            git add daily_cache.json
+          fi
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update scanner state and daily cache [skip ci]"
             git push
+          else
+            echo "No state or cache changes to save."
           fi
