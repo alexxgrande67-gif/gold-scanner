@@ -668,7 +668,7 @@ def fb_events(days):
         if strong_l:
             ev[i]["l"].append({
                 "price": lp,
-            "time": days[p]["time"]
+                "time": days[p]["time"]
             })
 
     return ev, atr
@@ -806,8 +806,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                b["high"] >= x["price"] + D
-                or b["low"] <= x["price"] - D
+                    b["high"] >= x["price"] + D
+                    or b["low"] <= x["price"] - D
                 )
             ):
                 x["st"] = 2
@@ -836,8 +836,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                b["low"] <= x["price"] - D
-                or b["high"] >= x["price"] + D
+                    b["low"] <= x["price"] - D
+                    or b["high"] >= x["price"] + D
                 )
             ):
                 x["st"] = 2
@@ -1029,7 +1029,7 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             exchange,
             sym,
             "5m",
-            1000
+            288
         )
 
         days = [
@@ -1049,7 +1049,7 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 "time": int(k[0]),
                 "open": k[1],
                 "high": k[2],
-            "low": k[3],
+                "low": k[3],
                 "close": k[4],
                 "volume": k[5]
             }
