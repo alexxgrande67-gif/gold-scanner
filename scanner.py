@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -24,6 +25,18 @@ OKX = "https://www.okx.com"
 GATE = "https://api.gateio.ws/api/v4"
 
 STATE_FILE = Path("state.json")
+
+# Daily candle cache
+DAILY_CACHE_FILE = Path("daily_cache.json")
+DAILY_CACHE_LIMIT = 700
+DAILY_CACHE_UPDATE = 30
+
+_daily_cache = {}
+_daily_cache_lock = threading.Lock()
+_daily_cache_exchange = None
+_daily_cache_saved_date = None
+_daily_cache_force_save = False
+_daily_cache_new_symbol = False
 
 # False-breakout parameters
 FB = {
@@ -535,18 +548,275 @@ def get_bars(exchange, symbol, interval, limit):
     return _normalise_rows(rows, "gate")
 
 
-def _daily_rows(symbol: str, limit: int):
-    if ACTIVE_EXCHANGE == "okx":
-        return _okx_rows(
-            symbol.replace("USDT", "-USDT-SWAP"),
-            "1D",
-            limit
+# ============================================================
+# DAILY CANDLE CACHE
+# ============================================================
+
+def load_daily_cache(exchange):
+    """
+    Load persistent daily candle cache.
+
+    Cache is exchange-specific. If the file is missing,
+    corrupted or belongs to another exchange, full history
+    will be downloaded.
+    """
+
+    global _daily_cache
+    global _daily_cache_exchange
+    global _daily_cache_saved_date
+    global _daily_cache_force_save
+
+    today = time.strftime(
+        "%Y-%m-%d",
+        time.gmtime()
+    )
+
+    _daily_cache = {}
+    _daily_cache_exchange = exchange
+    _daily_cache_saved_date = None
+    _daily_cache_force_save = False
+
+    if not DAILY_CACHE_FILE.exists():
+        print(
+            "[CACHE] Daily cache not found. "
+            "Full history will be downloaded.",
+            flush=True
         )
 
-    return _gate_rows(
-        _base(symbol) + "_USDT",
+        _daily_cache_force_save = True
+        return
+
+    try:
+        data = json.loads(
+            DAILY_CACHE_FILE.read_text()
+        )
+
+        if data.get("version") != 1:
+            raise ValueError("Unsupported cache version")
+
+        if data.get("exchange") != exchange:
+            raise ValueError(
+                "Cached exchange does not match active exchange"
+            )
+
+        symbols = data.get("symbols", {})
+
+        if not isinstance(symbols, dict):
+            raise ValueError("Invalid symbols structure")
+
+        valid_symbols = {}
+
+        for symbol, rows in symbols.items():
+            if not isinstance(rows, list):
+                continue
+
+            valid_rows = []
+
+            for row in rows:
+                if not isinstance(row, list) or len(row) != 6:
+                    continue
+
+                try:
+                    valid_rows.append([
+                        int(row[0]),
+                        float(row[1]),
+                        float(row[2]),
+                        float(row[3]),
+                        float(row[4]),
+                        float(row[5])
+                    ])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+
+            # Remove duplicate timestamps and keep newest 700.
+            unique_rows = {
+                row[0]: row
+                for row in valid_rows
+            }
+
+            valid_rows = [
+                unique_rows[ts]
+                for ts in sorted(unique_rows)
+            ][-DAILY_CACHE_LIMIT:]
+
+            if len(valid_rows) >= 60:
+                valid_symbols[symbol] = valid_rows
+
+        _daily_cache = valid_symbols
+        _daily_cache_saved_date = data.get("saved_utc_date")
+
+        print(
+            f"[CACHE] Loaded {len(_daily_cache)} symbols; "
+            f"saved date={_daily_cache_saved_date}",
+            flush=True
+        )
+
+        if _daily_cache_saved_date != today:
+            print(
+                "[CACHE] New UTC day detected. "
+                "Cache will be persisted after this scan.",
+                flush=True
+            )
+
+    except Exception as exc:
+        print(
+            f"[CACHE] Cannot read daily cache: "
+            f"{type(exc).__name__}: {exc}. "
+            f"Full history will be downloaded.",
+            flush=True
+        )
+
+        _daily_cache = {}
+        _daily_cache_saved_date = None
+        _daily_cache_force_save = True
+
+
+def get_daily_bars(exchange, symbol):
+    """
+    Return the latest 700 daily candles.
+
+    First run / missing symbol:
+        Download 700 candles.
+
+    Normal run:
+        Download the latest 30 candles and merge them
+        with the cached history by timestamp.
+    """
+
+    global _daily_cache_new_symbol
+
+    with _daily_cache_lock:
+        cached = _daily_cache.get(symbol)
+
+        if cached:
+            cached = list(cached)
+
+    if cached and len(cached) >= 60:
+        fetch_limit = DAILY_CACHE_UPDATE
+
+        print(
+            f"[CACHE] {symbol}: updating with "
+            f"{fetch_limit} daily candles",
+            flush=True
+        )
+
+    else:
+        fetch_limit = DAILY_CACHE_LIMIT
+
+        print(
+            f"[CACHE] {symbol}: downloading full "
+            f"{fetch_limit}-candle history",
+            flush=True
+        )
+
+    fresh_rows = get_bars(
+        exchange,
+        symbol,
         "1d",
-        limit
+        fetch_limit
+    )
+
+    if not fresh_rows:
+        raise RuntimeError(
+            f"No daily candles received for {symbol}"
+        )
+
+    # Merge by timestamp. Fresh data replaces old data
+    # when the timestamp already exists. This also refreshes
+    # the currently forming daily candle.
+    merged = {}
+
+    if cached:
+        for row in cached:
+            merged[int(row[0])] = row
+
+    for row in fresh_rows:
+        merged[int(row[0])] = row
+
+    result = [
+        merged[ts]
+        for ts in sorted(merged)
+    ][-DAILY_CACHE_LIMIT:]
+
+    if len(result) < 60:
+        raise RuntimeError(
+            f"Insufficient daily history for {symbol}: "
+            f"{len(result)} candles"
+        )
+
+    with _daily_cache_lock:
+        _daily_cache[symbol] = result
+
+        if not cached:
+            _daily_cache_new_symbol = True
+
+    return result
+
+
+def save_daily_cache_if_needed():
+    """
+    Persist cache once per UTC day, on first initialization,
+    or when a new symbol has been added.
+
+    The in-memory cache is still refreshed on every scan.
+    """
+
+    global _daily_cache_saved_date
+    global _daily_cache_force_save
+    global _daily_cache_new_symbol
+
+    today = time.strftime(
+        "%Y-%m-%d",
+        time.gmtime()
+    )
+
+    should_save = (
+        _daily_cache_force_save
+        or _daily_cache_new_symbol
+        or _daily_cache_saved_date != today
+    )
+
+    if not should_save:
+        print(
+            "[CACHE] Persistent cache unchanged; "
+            "skipping file write.",
+            flush=True
+        )
+        return
+
+    with _daily_cache_lock:
+        data = {
+            "version": 1,
+            "exchange": _daily_cache_exchange,
+            "saved_utc_date": today,
+            "symbols": _daily_cache
+        }
+
+        temp_file = DAILY_CACHE_FILE.with_suffix(".tmp")
+
+        temp_file.write_text(
+            json.dumps(
+                data,
+                separators=(",", ":"),
+                ensure_ascii=False
+            )
+        )
+
+        temp_file.replace(DAILY_CACHE_FILE)
+
+        symbol_count = len(_daily_cache)
+
+    _daily_cache_saved_date = today
+    _daily_cache_force_save = False
+    _daily_cache_new_symbol = False
+
+    size_mb = DAILY_CACHE_FILE.stat().st_size / (1024 * 1024)
+
+    print(
+        f"[CACHE] Saved {symbol_count} symbols; "
+        f"file size={size_mb:.2f} MB; "
+        f"UTC date={today}",
+        flush=True
     )
 
 
@@ -668,7 +938,7 @@ def fb_events(days):
         if strong_l:
             ev[i]["l"].append({
                 "price": lp,
-            "time": days[p]["time"]
+                "time": days[p]["time"]
             })
 
     return ev, atr
@@ -806,8 +1076,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                b["high"] >= x["price"] + D
-                or b["low"] <= x["price"] - D
+                    b["high"] >= x["price"] + D
+                    or b["low"] <= x["price"] - D
                 )
             ):
                 x["st"] = 2
@@ -836,8 +1106,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                b["low"] <= x["price"] - D
-                or b["high"] >= x["price"] + D
+                    b["low"] <= x["price"] - D
+                    or b["high"] >= x["price"] + D
                 )
             ):
                 x["st"] = 2
@@ -1018,11 +1288,9 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
     """
 
     try:
-        days_raw = get_bars(
+        days_raw = get_daily_bars(
             exchange,
-            sym,
-            "1d",
-            700
+            sym
         )
 
         m5_raw = get_bars(
@@ -1049,7 +1317,7 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 "time": int(k[0]),
                 "open": k[1],
                 "high": k[2],
-            "low": k[3],
+                "low": k[3],
                 "close": k[4],
                 "volume": k[5]
             }
@@ -1174,6 +1442,9 @@ def main():
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
 
+    # Load persistent daily cache before starting workers.
+    load_daily_cache(exchange)
+
     print(
         f"Universe selected: {len(symbols)} symbols; "
         f"monitor cap={MAX_MONITORED}; "
@@ -1288,6 +1559,9 @@ def main():
                     flush=True
                 )
 
+    # Persist daily cache after all worker threads finish.
+    save_daily_cache_if_needed()
+
     if not state.get("primed"):
         state["primed"] = True
 
@@ -1309,7 +1583,7 @@ def main():
     )
 
     # ========================================================
-    # NEW: chronological sorting (oldest first, newest last)
+    # CHRONOLOGICAL SORTING (OLDEST FIRST, NEWEST LAST)
     # ========================================================
 
     discovered.sort(
