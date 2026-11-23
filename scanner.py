@@ -46,6 +46,15 @@ FB = {
     "leaveAtr": 0.5
 }
 
+# Minimum history required by the existing signal engine.
+# fb_compute() requires at least swing * 2 + 20 candles.
+MIN_DAILY_CANDLES = max(
+    FB["swing"] * 2 + 20,
+    15
+)
+
+MIN_5M_CANDLES = 30
+
 TOP_UNIVERSE = 500
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
@@ -556,9 +565,10 @@ def load_daily_cache(exchange):
     """
     Load persistent daily candle cache.
 
-    Cache is exchange-specific. If the file is missing,
-    corrupted or belongs to another exchange, full history
-    will be downloaded.
+    Short histories are valid cache entries too.
+    Even a symbol with fewer than MIN_DAILY_CANDLES
+    is retained to avoid downloading the same history
+    from scratch on every run.
     """
 
     global _daily_cache
@@ -639,7 +649,8 @@ def load_daily_cache(exchange):
                 for ts in sorted(unique_rows)
             ][-DAILY_CACHE_LIMIT:]
 
-            if len(valid_rows) >= 60:
+            # Keep every non-empty history, including short ones.
+            if valid_rows:
                 valid_symbols[symbol] = valid_rows
 
         _daily_cache = valid_symbols
@@ -673,14 +684,18 @@ def load_daily_cache(exchange):
 
 def get_daily_bars(exchange, symbol):
     """
-    Return the latest 700 daily candles.
+    Return up to 700 daily candles.
 
-    First run / missing symbol:
-        Download 700 candles.
+    New symbol:
+        Download up to 700 candles.
 
-    Normal run:
+    Cached symbol:
         Download the latest 30 candles and merge them
-        with the cached history by timestamp.
+        with cached history.
+
+    Short histories are retained and returned.
+    The caller decides whether there are enough candles
+    for the signal engine.
     """
 
     global _daily_cache_new_symbol
@@ -691,12 +706,13 @@ def get_daily_bars(exchange, symbol):
         if cached:
             cached = list(cached)
 
-    if cached and len(cached) >= 60:
+    if cached:
         fetch_limit = DAILY_CACHE_UPDATE
 
         print(
             f"[CACHE] {symbol}: updating with "
-            f"{fetch_limit} daily candles",
+            f"{fetch_limit} daily candles "
+            f"(cached={len(cached)})",
             flush=True
         )
 
@@ -738,17 +754,49 @@ def get_daily_bars(exchange, symbol):
         for ts in sorted(merged)
     ][-DAILY_CACHE_LIMIT:]
 
-    if len(result) < 60:
-        raise RuntimeError(
-            f"Insufficient daily history for {symbol}: "
-            f"{len(result)} candles"
-        )
-
+    # Save the available history even when it is too short
+    # for the signal engine.
     with _daily_cache_lock:
         _daily_cache[symbol] = result
 
         if not cached:
             _daily_cache_new_symbol = True
+
+    # Report the actual beginning of available history.
+    if len(result) < DAILY_CACHE_LIMIT:
+        first_timestamp = result[0][0]
+
+        first_date = time.strftime(
+            "%Y-%m-%d",
+            time.gmtime(first_timestamp)
+        )
+
+        age_days = max(
+            0,
+            int(
+                (time.time() - first_timestamp) / 86400
+            )
+        )
+
+        if len(result) < MIN_DAILY_CANDLES:
+            status = (
+                f"insufficient for signal calculation; "
+                f"minimum={MIN_DAILY_CANDLES}"
+            )
+        else:
+            status = (
+                "enough for signal calculation; "
+                "using available history"
+            )
+
+        print(
+            f"[HISTORY] {symbol}: available={len(result)}/"
+            f"{DAILY_CACHE_LIMIT}; "
+            f"first candle={first_date}; "
+            f"history span≈{age_days} days; "
+            f"{status}",
+            flush=True
+        )
 
     return result
 
@@ -1293,6 +1341,19 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             sym
         )
 
+        # Short daily history is not a fatal scanner error.
+        # It is checked against the actual signal-engine minimum.
+        if len(days_raw) < MIN_DAILY_CANDLES:
+            return (
+                sym,
+                [],
+                [],
+                False,
+                f"insufficient daily history "
+                f"({len(days_raw)} available; "
+                f"{MIN_DAILY_CANDLES} required)"
+            )
+
         m5_raw = get_bars(
             exchange,
             sym,
@@ -1324,14 +1385,15 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             for k in m5_raw
         ]
 
-        if len(days) < 60 or len(m5) < 30:
+        if len(m5) < MIN_5M_CANDLES:
             return (
                 sym,
                 [],
                 [],
                 False,
-                f"insufficient candle history "
-                f"(daily={len(days)}, 5m={len(m5)})"
+                f"insufficient 5m history "
+                f"({len(m5)} available; "
+                f"{MIN_5M_CANDLES} required)"
             )
 
         highs = [
@@ -1418,6 +1480,8 @@ def main():
     print(
         f"[CONFIG] swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
+        f"min_daily_candles={MIN_DAILY_CANDLES}; "
+        f"min_5m_candles={MIN_5M_CANDLES}; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
         f"http_retries={HTTP_RETRIES}",
