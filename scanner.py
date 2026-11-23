@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -26,18 +25,6 @@ GATE = "https://api.gateio.ws/api/v4"
 
 STATE_FILE = Path("state.json")
 
-# Daily candle cache
-DAILY_CACHE_FILE = Path("daily_cache.json")
-DAILY_CACHE_LIMIT = 700
-DAILY_CACHE_UPDATE = 30
-
-_daily_cache = {}
-_daily_cache_lock = threading.Lock()
-_daily_cache_exchange = None
-_daily_cache_saved_date = None
-_daily_cache_force_save = False
-_daily_cache_new_symbol = False
-
 # False-breakout parameters
 FB = {
     "swing": 1,
@@ -45,15 +32,6 @@ FB = {
     "mergeAtr": 0.5,
     "leaveAtr": 0.5
 }
-
-# Minimum history required by the existing signal engine.
-# fb_compute() requires at least swing * 2 + 20 candles.
-MIN_DAILY_CANDLES = max(
-    FB["swing"] * 2 + 20,
-    15
-)
-
-MIN_5M_CANDLES = 30
 
 TOP_UNIVERSE = 500
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
@@ -557,314 +535,18 @@ def get_bars(exchange, symbol, interval, limit):
     return _normalise_rows(rows, "gate")
 
 
-# ============================================================
-# DAILY CANDLE CACHE
-# ============================================================
-
-def load_daily_cache(exchange):
-    """
-    Load persistent daily candle cache.
-
-    Short histories are valid cache entries too.
-    Even a symbol with fewer than MIN_DAILY_CANDLES
-    is retained to avoid downloading the same history
-    from scratch on every run.
-    """
-
-    global _daily_cache
-    global _daily_cache_exchange
-    global _daily_cache_saved_date
-    global _daily_cache_force_save
-
-    today = time.strftime(
-        "%Y-%m-%d",
-        time.gmtime()
-    )
-
-    _daily_cache = {}
-    _daily_cache_exchange = exchange
-    _daily_cache_saved_date = None
-    _daily_cache_force_save = False
-
-    if not DAILY_CACHE_FILE.exists():
-        print(
-            "[CACHE] Daily cache not found. "
-            "Full history will be downloaded.",
-            flush=True
+def _daily_rows(symbol: str, limit: int):
+    if ACTIVE_EXCHANGE == "okx":
+        return _okx_rows(
+            symbol.replace("USDT", "-USDT-SWAP"),
+            "1D",
+            limit
         )
 
-        _daily_cache_force_save = True
-        return
-
-    try:
-        data = json.loads(
-            DAILY_CACHE_FILE.read_text()
-        )
-
-        if data.get("version") != 1:
-            raise ValueError("Unsupported cache version")
-
-        if data.get("exchange") != exchange:
-            raise ValueError(
-                "Cached exchange does not match active exchange"
-            )
-
-        symbols = data.get("symbols", {})
-
-        if not isinstance(symbols, dict):
-            raise ValueError("Invalid symbols structure")
-
-        valid_symbols = {}
-
-        for symbol, rows in symbols.items():
-            if not isinstance(rows, list):
-                continue
-
-            valid_rows = []
-
-            for row in rows:
-                if not isinstance(row, list) or len(row) != 6:
-                    continue
-
-                try:
-                    valid_rows.append([
-                        int(row[0]),
-                        float(row[1]),
-                        float(row[2]),
-                        float(row[3]),
-                        float(row[4]),
-                        float(row[5])
-                    ])
-                except (TypeError, ValueError, OverflowError):
-                    continue
-
-            # Remove duplicate timestamps and keep newest 700.
-            unique_rows = {
-                row[0]: row
-                for row in valid_rows
-            }
-
-            valid_rows = [
-                unique_rows[ts]
-                for ts in sorted(unique_rows)
-            ][-DAILY_CACHE_LIMIT:]
-
-            # Keep every non-empty history, including short ones.
-            if valid_rows:
-                valid_symbols[symbol] = valid_rows
-
-        _daily_cache = valid_symbols
-        _daily_cache_saved_date = data.get("saved_utc_date")
-
-        print(
-            f"[CACHE] Loaded {len(_daily_cache)} symbols; "
-            f"saved date={_daily_cache_saved_date}",
-            flush=True
-        )
-
-        if _daily_cache_saved_date != today:
-            print(
-                "[CACHE] New UTC day detected. "
-                "Cache will be persisted after this scan.",
-                flush=True
-            )
-
-    except Exception as exc:
-        print(
-            f"[CACHE] Cannot read daily cache: "
-            f"{type(exc).__name__}: {exc}. "
-            f"Full history will be downloaded.",
-            flush=True
-        )
-
-        _daily_cache = {}
-        _daily_cache_saved_date = None
-        _daily_cache_force_save = True
-
-
-def get_daily_bars(exchange, symbol):
-    """
-    Return up to 700 daily candles.
-
-    New symbol:
-        Download up to 700 candles.
-
-    Cached symbol:
-        Download the latest 30 candles and merge them
-        with cached history.
-
-    Short histories are retained and returned.
-    The caller decides whether there are enough candles
-    for the signal engine.
-    """
-
-    global _daily_cache_new_symbol
-
-    with _daily_cache_lock:
-        cached = _daily_cache.get(symbol)
-
-        if cached:
-            cached = list(cached)
-
-    if cached:
-        fetch_limit = DAILY_CACHE_UPDATE
-
-        print(
-            f"[CACHE] {symbol}: updating with "
-            f"{fetch_limit} daily candles "
-            f"(cached={len(cached)})",
-            flush=True
-        )
-
-    else:
-        fetch_limit = DAILY_CACHE_LIMIT
-
-        print(
-            f"[CACHE] {symbol}: downloading full "
-            f"{fetch_limit}-candle history",
-            flush=True
-        )
-
-    fresh_rows = get_bars(
-        exchange,
-        symbol,
+    return _gate_rows(
+        _base(symbol) + "_USDT",
         "1d",
-        fetch_limit
-    )
-
-    if not fresh_rows:
-        raise RuntimeError(
-            f"No daily candles received for {symbol}"
-        )
-
-    # Merge by timestamp. Fresh data replaces old data
-    # when the timestamp already exists. This also refreshes
-    # the currently forming daily candle.
-    merged = {}
-
-    if cached:
-        for row in cached:
-            merged[int(row[0])] = row
-
-    for row in fresh_rows:
-        merged[int(row[0])] = row
-
-    result = [
-        merged[ts]
-        for ts in sorted(merged)
-    ][-DAILY_CACHE_LIMIT:]
-
-    # Save the available history even when it is too short
-    # for the signal engine.
-    with _daily_cache_lock:
-        _daily_cache[symbol] = result
-
-        if not cached:
-            _daily_cache_new_symbol = True
-
-    # Report the actual beginning of available history.
-    if len(result) < DAILY_CACHE_LIMIT:
-        first_timestamp = result[0][0]
-
-        first_date = time.strftime(
-            "%Y-%m-%d",
-            time.gmtime(first_timestamp)
-        )
-
-        age_days = max(
-            0,
-            int(
-                (time.time() - first_timestamp) / 86400
-            )
-        )
-
-        if len(result) < MIN_DAILY_CANDLES:
-            status = (
-                f"insufficient for signal calculation; "
-                f"minimum={MIN_DAILY_CANDLES}"
-            )
-        else:
-            status = (
-                "enough for signal calculation; "
-                "using available history"
-            )
-
-        print(
-            f"[HISTORY] {symbol}: available={len(result)}/"
-            f"{DAILY_CACHE_LIMIT}; "
-            f"first candle={first_date}; "
-            f"history span≈{age_days} days; "
-            f"{status}",
-            flush=True
-        )
-
-    return result
-
-
-def save_daily_cache_if_needed():
-    """
-    Persist cache once per UTC day, on first initialization,
-    or when a new symbol has been added.
-
-    The in-memory cache is still refreshed on every scan.
-    """
-
-    global _daily_cache_saved_date
-    global _daily_cache_force_save
-    global _daily_cache_new_symbol
-
-    today = time.strftime(
-        "%Y-%m-%d",
-        time.gmtime()
-    )
-
-    should_save = (
-        _daily_cache_force_save
-        or _daily_cache_new_symbol
-        or _daily_cache_saved_date != today
-    )
-
-    if not should_save:
-        print(
-            "[CACHE] Persistent cache unchanged; "
-            "skipping file write.",
-            flush=True
-        )
-        return
-
-    with _daily_cache_lock:
-        data = {
-            "version": 1,
-            "exchange": _daily_cache_exchange,
-            "saved_utc_date": today,
-            "symbols": _daily_cache
-        }
-
-        temp_file = DAILY_CACHE_FILE.with_suffix(".tmp")
-
-        temp_file.write_text(
-            json.dumps(
-                data,
-                separators=(",", ":"),
-                ensure_ascii=False
-            )
-        )
-
-        temp_file.replace(DAILY_CACHE_FILE)
-
-        symbol_count = len(_daily_cache)
-
-    _daily_cache_saved_date = today
-    _daily_cache_force_save = False
-    _daily_cache_new_symbol = False
-
-    size_mb = DAILY_CACHE_FILE.stat().st_size / (1024 * 1024)
-
-    print(
-        f"[CACHE] Saved {symbol_count} symbols; "
-        f"file size={size_mb:.2f} MB; "
-        f"UTC date={today}",
-        flush=True
+        limit
     )
 
 
@@ -986,7 +668,7 @@ def fb_events(days):
         if strong_l:
             ev[i]["l"].append({
                 "price": lp,
-                "time": days[p]["time"]
+            "time": days[p]["time"]
             })
 
     return ev, atr
@@ -1124,8 +806,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                    b["high"] >= x["price"] + D
-                    or b["low"] <= x["price"] - D
+                b["high"] >= x["price"] + D
+                or b["low"] <= x["price"] - D
                 )
             ):
                 x["st"] = 2
@@ -1154,8 +836,8 @@ def fb_compute(days, m5, now_ms=None):
                 x["st"] == 1
                 and x["touch"] < b["time"]
                 and (
-                    b["low"] <= x["price"] - D
-                    or b["high"] >= x["price"] + D
+                b["low"] <= x["price"] - D
+                or b["high"] >= x["price"] + D
                 )
             ):
                 x["st"] = 2
@@ -1336,23 +1018,12 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
     """
 
     try:
-        days_raw = get_daily_bars(
+        days_raw = get_bars(
             exchange,
-            sym
+            sym,
+            "1d",
+            700
         )
-
-        # Short daily history is not a fatal scanner error.
-        # It is checked against the actual signal-engine minimum.
-        if len(days_raw) < MIN_DAILY_CANDLES:
-            return (
-                sym,
-                [],
-                [],
-                False,
-                f"insufficient daily history "
-                f"({len(days_raw)} available; "
-                f"{MIN_DAILY_CANDLES} required)"
-            )
 
         m5_raw = get_bars(
             exchange,
@@ -1378,22 +1049,21 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 "time": int(k[0]),
                 "open": k[1],
                 "high": k[2],
-                "low": k[3],
+            "low": k[3],
                 "close": k[4],
                 "volume": k[5]
             }
             for k in m5_raw
         ]
 
-        if len(m5) < MIN_5M_CANDLES:
+        if len(days) < 60 or len(m5) < 30:
             return (
                 sym,
                 [],
                 [],
                 False,
-                f"insufficient 5m history "
-                f"({len(m5)} available; "
-                f"{MIN_5M_CANDLES} required)"
+                f"insufficient candle history "
+                f"(daily={len(days)}, 5m={len(m5)})"
             )
 
         highs = [
@@ -1480,8 +1150,6 @@ def main():
     print(
         f"[CONFIG] swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
-        f"min_daily_candles={MIN_DAILY_CANDLES}; "
-        f"min_5m_candles={MIN_5M_CANDLES}; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
         f"http_retries={HTTP_RETRIES}",
@@ -1505,9 +1173,6 @@ def main():
 
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
-
-    # Load persistent daily cache before starting workers.
-    load_daily_cache(exchange)
 
     print(
         f"Universe selected: {len(symbols)} symbols; "
@@ -1623,9 +1288,6 @@ def main():
                     flush=True
                 )
 
-    # Persist daily cache after all worker threads finish.
-    save_daily_cache_if_needed()
-
     if not state.get("primed"):
         state["primed"] = True
 
@@ -1647,7 +1309,7 @@ def main():
     )
 
     # ========================================================
-    # CHRONOLOGICAL SORTING (OLDEST FIRST, NEWEST LAST)
+    # NEW: chronological sorting (oldest first, newest last)
     # ========================================================
 
     discovered.sort(
