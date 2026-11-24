@@ -43,7 +43,7 @@ jobs:
           MAX_MONITORED: '1000'
         run: python scanner.py
 
-      - name: Save scanner state and daily cache
+      - name: Save scanner state and caches
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -54,8 +54,12 @@ jobs:
             git add daily_cache.json
           fi
 
+          if [ -f 4h_cache.json ]; then
+            git add 4h_cache.json
+          fi
+
           if ! git diff --cached --quiet; then
-            git commit -m "Update scanner state and daily cache [skip ci]"
+            git commit -m "Update scanner state and caches [skip ci]"
             git push
           else
             echo "No state or cache changes to save."
