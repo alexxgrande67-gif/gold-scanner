@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -2114,6 +2113,17 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 seed_keys.append(key)
 
             elif key not in seen_snapshot:
+
+                # NEW FILTER:
+                # Daily level must be at least 5 days old
+                # at the moment of the breakout.
+                level_age_seconds = (
+                    event["touch"] - event["time"]
+                )
+
+                if level_age_seconds < 5 * 86400:
+                    continue
+
                 _attach_chart_candle(
                     event,
                     days,
@@ -2137,6 +2147,17 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 seed_keys.append(key)
 
             elif key not in seen_snapshot:
+
+                # NEW FILTER:
+                # 4H level must be at least 24 hours old
+                # at the moment of the breakout.
+                level_age_seconds = (
+                    event["touch"] - event["time"]
+                )
+
+                if level_age_seconds < 24 * 3600:
+                    continue
+
                 _attach_chart_candle(
                     event,
                     four_hours,
@@ -2351,7 +2372,6 @@ def main():
         key=lambda item: item[1]["touch"]
     )
 
-    
     for sym, event, atr_pct, key in discovered:
 
         # Не отправляем сигналы старше 15 минут
@@ -2373,7 +2393,6 @@ def main():
         )
 
         dt = time.strftime(
-
             "%Y-%m-%d %H:%M UTC",
             time.gmtime(event["touch"])
         )
