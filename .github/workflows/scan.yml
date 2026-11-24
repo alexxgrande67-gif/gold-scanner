@@ -40,7 +40,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_TEST: ${{ inputs.telegram_test && '1' || '0' }}
-          MAX_MONITORED: '500'
+          MAX_MONITORED: '1000'
         run: python scanner.py
 
       - name: Save scanner state and daily cache
