@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -37,6 +38,17 @@ _daily_cache = {
     "symbols": {}
 }
 _daily_cache_lock = threading.Lock()
+
+# 4H candles cache
+FOUR_HOUR_CACHE_FILE = Path("4h_cache.json")
+FOUR_HOUR_CACHE_VERSION = 1
+
+_four_hour_cache = {
+    "version": FOUR_HOUR_CACHE_VERSION,
+    "exchange": None,
+    "symbols": {}
+}
+_four_hour_cache_lock = threading.Lock()
 
 # False-breakout parameters
 FB = {
@@ -491,7 +503,12 @@ def get_bars(exchange, symbol, interval, limit):
             "-USDT-SWAP"
         )
 
-        bar = "5m" if interval == "5m" else "1D"
+        if interval == "5m":
+            bar = "5m"
+        elif interval == "4h":
+            bar = "4H"
+        else:
+            bar = "1D"
 
         rows = _okx_rows(
             inst_id,
@@ -502,7 +519,13 @@ def get_bars(exchange, symbol, interval, limit):
         return _normalise_rows(rows, "okx")
 
     contract = _base(symbol) + "_USDT"
-    gate_interval = "5m" if interval == "5m" else "1d"
+
+    if interval == "5m":
+        gate_interval = "5m"
+    elif interval == "4h":
+        gate_interval = "4h"
+    else:
+        gate_interval = "1d"
 
     rows = _gate_rows(
         contract,
@@ -687,6 +710,181 @@ def save_daily_cache():
 
 
 # ============================================================
+# 4H CANDLES CACHE
+# ============================================================
+
+def load_4h_cache(exchange):
+    global _four_hour_cache
+
+    if not FOUR_HOUR_CACHE_FILE.exists():
+        print(
+            "[CACHE] 4h_cache.json not found; "
+            "full 4H history will be downloaded.",
+            flush=True
+        )
+
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+        return
+
+    try:
+        data = json.loads(
+            FOUR_HOUR_CACHE_FILE.read_text(encoding="utf-8")
+        )
+
+        if (
+            data.get("version") != FOUR_HOUR_CACHE_VERSION
+            or data.get("exchange") != exchange
+            or not isinstance(data.get("symbols"), dict)
+        ):
+            print(
+                "[CACHE] 4H cache version or exchange mismatch; "
+                "starting with an empty cache.",
+                flush=True
+            )
+
+            _four_hour_cache = {
+                "version": FOUR_HOUR_CACHE_VERSION,
+                "exchange": exchange,
+                "symbols": {}
+            }
+            return
+
+        valid_symbols = {}
+
+        for symbol, rows in data["symbols"].items():
+            if not isinstance(rows, list):
+                continue
+
+            valid_rows = []
+
+            for row in rows:
+                try:
+                    if len(row) < 6:
+                        continue
+
+                    valid_rows.append([
+                        int(row[0]),
+                        float(row[1]),
+                        float(row[2]),
+                        float(row[3]),
+                        float(row[4]),
+                        float(row[5])
+                    ])
+                except (TypeError, ValueError):
+                    continue
+
+            valid_rows.sort(key=lambda x: x[0])
+
+            if valid_rows:
+                valid_symbols[symbol] = valid_rows[-700:]
+
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": valid_symbols
+        }
+
+        print(
+            f"[CACHE] Loaded 4H history for "
+            f"{len(valid_symbols)} symbols.",
+            flush=True
+        )
+
+    except Exception as exc:
+        print(
+            f"[CACHE] Cannot read 4H cache: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
+
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+
+
+def get_cached_4h_bars(exchange, symbol):
+    with _four_hour_cache_lock:
+        cached = _four_hour_cache["symbols"].get(symbol, [])
+        cached = [row[:] for row in cached]
+
+    download_limit = 30 if cached else 700
+
+    try:
+        fresh = get_bars(
+            exchange,
+            symbol,
+            "4h",
+            download_limit
+        )
+
+        merged = {
+            int(row[0]): row
+            for row in cached
+        }
+
+        for row in fresh:
+            merged[int(row[0])] = row
+
+        result = [
+            merged[ts]
+            for ts in sorted(merged)
+        ][-700:]
+
+        with _four_hour_cache_lock:
+            _four_hour_cache["symbols"][symbol] = result
+
+        return result
+
+    except Exception as exc:
+        if len(cached) >= 60:
+            print(
+                f"[CACHE] {symbol}: 4H refresh failed; "
+                f"using cached history. "
+                f"{type(exc).__name__}: {exc}",
+                flush=True
+            )
+            return cached
+
+        raise
+
+
+def save_4h_cache():
+    with _four_hour_cache_lock:
+        data = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": _four_hour_cache["exchange"],
+            "symbols": _four_hour_cache["symbols"]
+        }
+
+        serialized = json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+    temp_file = FOUR_HOUR_CACHE_FILE.with_suffix(".tmp")
+
+    temp_file.write_text(
+        serialized,
+        encoding="utf-8"
+    )
+
+    temp_file.replace(FOUR_HOUR_CACHE_FILE)
+
+    print(
+        f"[CACHE] Saved 4H history for "
+        f"{len(data['symbols'])} symbols.",
+        flush=True
+    )
+
+
+# ============================================================
 # FALSE BREAKOUT ENGINE
 # ============================================================
 
@@ -809,7 +1007,19 @@ def fb_events(days):
     return ev, atr
 
 
-def fb_compute(days, m5, now_ms=None):
+def fb_compute(days, m5, now_ms=None, interval_seconds=86400):
+    """
+    Build levels on the selected timeframe and detect their
+    false-breakout/touch events using 5-minute candles.
+
+    interval_seconds:
+        86400 = daily levels
+        14400 = 4H levels
+
+    Historical invalidation is checked using the same timeframe
+    as the level formation timeframe.
+    """
+
     n = len(days)
     L = FB["swing"]
 
@@ -843,7 +1053,7 @@ def fb_compute(days, m5, now_ms=None):
         if len(arr) > 240:
             arr.pop(0)
 
-    def add_day(i):
+    def add_bar(i):
         e = ev[i]
 
         if e:
@@ -854,14 +1064,15 @@ def fb_compute(days, m5, now_ms=None):
                 add(Lo, "L", x, e["atr"] or 0)
 
     if m5:
-        ds = (
-            (m5[0]["time"] + 86399) // 86400
-        ) * 86400
+        start_boundary = (
+            (m5[0]["time"] + interval_seconds - 1)
+            // interval_seconds
+        ) * interval_seconds
 
         k = next(
             (
                 i for i, d in enumerate(days)
-                if d["time"] >= ds
+                if d["time"] >= start_boundary
             ),
             -1
         )
@@ -873,8 +1084,11 @@ def fb_compute(days, m5, now_ms=None):
     if i_start > n - 1:
         i_start = n - 1
 
+    # Reconstruct levels before the available 5m history.
+    # Daily levels are invalidated by daily candles.
+    # 4H levels are invalidated by 4H candles.
     for i in range(i_start):
-        add_day(i)
+        add_bar(i)
 
         H = [
             x for x in H
@@ -889,7 +1103,7 @@ def fb_compute(days, m5, now_ms=None):
     events = []
     cur = i_start
 
-    add_day(cur)
+    add_bar(cur)
 
     now_sec = (
         (now_ms or int(time.time() * 1000)) / 1000
@@ -904,7 +1118,7 @@ def fb_compute(days, m5, now_ms=None):
             and b["time"] >= days[cur + 1]["time"]
         ):
             cur += 1
-            add_day(cur)
+            add_bar(cur)
 
         closed = (
             bi < len(m5) - 1
@@ -1089,10 +1303,13 @@ def send_telegram(sym, event, atr_pct):
         int((event["touch"] - event["time"]) // 86400)
     )
 
+    timeframe = event.get("timeframe", "1D")
+
     message = (
         "🟡 <b>GOLD SCANNER</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"Монета: <b>{html.escape(sym)}</b>\n"
+        f"Таймфрейм: <b>{timeframe}</b>\n"
         f"Сигнал: <b>{side}</b>\n"
         f"Уровень: <code>{event['price']:.12g}</code>\n"
         f"Давность уровня: <b>{level_age_days} дн.</b>\n"
@@ -1102,7 +1319,7 @@ def send_telegram(sym, event, atr_pct):
 
     if telegram_post(message):
         print(
-            f"[TELEGRAM] Sent: {sym}",
+            f"[TELEGRAM] Sent: {sym} | {timeframe}",
             flush=True
         )
         return True
@@ -1151,12 +1368,20 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
     """
     Process one symbol independently.
 
+    Daily and 4H level systems are calculated independently.
+    Both use 5-minute candles for false-breakout detection.
+
     Returns:
         symbol, discovered events, seed keys, success, error
     """
 
     try:
         days_raw = get_cached_daily_bars(
+            exchange,
+            sym
+        )
+
+        four_hours_raw = get_cached_4h_bars(
             exchange,
             sym
         )
@@ -1180,6 +1405,18 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             for k in days_raw
         ]
 
+        four_hours = [
+            {
+                "time": int(k[0]),
+                "open": k[1],
+                "high": k[2],
+                "low": k[3],
+                "close": k[4],
+                "volume": k[5]
+            }
+            for k in four_hours_raw
+        ]
+
         m5 = [
             {
                 "time": int(k[0]),
@@ -1192,54 +1429,122 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             for k in m5_raw
         ]
 
-        if len(days) < 60 or len(m5) < 30:
+        if (
+            len(days) < 60
+            or len(four_hours) < 60
+            or len(m5) < 30
+        ):
             return (
                 sym,
                 [],
                 [],
                 False,
                 f"insufficient candle history "
-                f"(daily={len(days)}, 5m={len(m5)})"
+                f"(daily={len(days)}, "
+                f"4H={len(four_hours)}, "
+                f"5m={len(m5)})"
             )
 
-        highs = [
+        # ----------------------------------------------------
+        # DAILY ATR
+        # ----------------------------------------------------
+
+        daily_highs = [
             d["high"]
             for d in days[:-1]
         ]
 
-        lows = [
+        daily_lows = [
             d["low"]
             for d in days[:-1]
         ]
 
-        closes = [
+        daily_closes = [
             d["close"]
             for d in days[:-1]
         ]
 
-        atr_value = wilder_atr(
-            highs,
-            lows,
-            closes,
+        daily_atr_value = wilder_atr(
+            daily_highs,
+            daily_lows,
+            daily_closes,
             14
         )
 
-        last_close = days[-1]["close"]
+        daily_last_close = days[-1]["close"]
 
-        atr_pct = (
-            atr_value / last_close * 100
-            if atr_value and last_close > 0
+        daily_atr_pct = (
+            daily_atr_value / daily_last_close * 100
+            if daily_atr_value and daily_last_close > 0
             else 0.0
         )
 
-        result = fb_compute(days, m5)
+        # ----------------------------------------------------
+        # 4H ATR
+        # ----------------------------------------------------
+
+        four_hour_highs = [
+            d["high"]
+            for d in four_hours[:-1]
+        ]
+
+        four_hour_lows = [
+            d["low"]
+            for d in four_hours[:-1]
+        ]
+
+        four_hour_closes = [
+            d["close"]
+            for d in four_hours[:-1]
+        ]
+
+        four_hour_atr_value = wilder_atr(
+            four_hour_highs,
+            four_hour_lows,
+            four_hour_closes,
+            14
+        )
+
+        four_hour_last_close = four_hours[-1]["close"]
+
+        four_hour_atr_pct = (
+            four_hour_atr_value / four_hour_last_close * 100
+            if four_hour_atr_value and four_hour_last_close > 0
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # DAILY LEVELS AND SIGNALS
+        # Existing daily calculation remains unchanged.
+        # ----------------------------------------------------
+
+        daily_result = fb_compute(
+            days,
+            m5,
+            interval_seconds=86400
+        )
+
+        # ----------------------------------------------------
+        # 4H LEVELS AND SIGNALS
+        # 4H levels are invalidated by subsequent 4H candles.
+        # False-breakout detection still uses the 5m candles.
+        # ----------------------------------------------------
+
+        four_hour_result = fb_compute(
+            four_hours,
+            m5,
+            interval_seconds=14400
+        )
 
         discovered = []
         seed_keys = []
 
-        for event in result["events"]:
+        # Process daily events.
+        for event in daily_result["events"]:
+            event["timeframe"] = "1D"
+
             key = (
-                f"{sym}|{event['side']}|{event['time']}|"
+                f"{sym}|1D|{event['side']}|{event['time']}|"
                 f"{event['price']:.12g}|{event['touch']}"
             )
 
@@ -1248,7 +1553,24 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
 
             elif key not in seen_snapshot:
                 discovered.append(
-                    (sym, event, atr_pct, key)
+                    (sym, event, daily_atr_pct, key)
+                )
+
+        # Process 4H events.
+        for event in four_hour_result["events"]:
+            event["timeframe"] = "4H"
+
+            key = (
+                f"{sym}|4H|{event['side']}|{event['time']}|"
+                f"{event['price']:.12g}|{event['touch']}"
+            )
+
+            if is_new_symbol:
+                seed_keys.append(key)
+
+            elif key not in seen_snapshot:
+                discovered.append(
+                    (sym, event, four_hour_atr_pct, key)
                 )
 
         return (
@@ -1286,6 +1608,10 @@ def main():
     print(
         f"[CONFIG] swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
+        f"mergeAtr={FB['mergeAtr']}; "
+        f"leaveAtr={FB['leaveAtr']}; "
+        f"daily=1D; "
+        f"additional=4H; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
         f"http_retries={HTTP_RETRIES}",
@@ -1308,8 +1634,9 @@ def main():
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
 
-    # Load daily candle cache for the selected exchange.
+    # Load daily and 4H candle caches.
     load_daily_cache(exchange)
+    load_4h_cache(exchange)
 
     print(
         f"Universe selected: {len(symbols)} symbols; "
@@ -1423,8 +1750,9 @@ def main():
                     flush=True
                 )
 
-    # Save updated daily cache after all workers have finished.
+    # Save updated daily and 4H caches after all workers finish.
     save_daily_cache()
+    save_4h_cache()
 
     if not state.get("primed"):
         state["primed"] = True
@@ -1462,7 +1790,8 @@ def main():
         )
 
         print(
-            f"SIGNAL | {sym} | {side} | "
+            f"SIGNAL | {sym} | {event.get('timeframe', '1D')} | "
+            f"{side} | "
             f"level={event['price']} | "
             f"candle={dt} | "
             f"ATR%={atr_pct:.2f}",
