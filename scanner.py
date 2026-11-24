@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -10,6 +9,7 @@ import math
 import os
 import time
 import threading
+from io import BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
+from PIL import Image, ImageDraw, ImageFont
 
 
 # ============================================================
@@ -80,6 +81,350 @@ ACTIVE_EXCHANGE = "okx"
 _thread_local = threading.local()
 _request_lock = threading.Lock()
 _last_request_time = 0.0
+
+
+# ============================================================
+# CHART GENERATION
+# ============================================================
+
+CHART_WIDTH = 1400
+CHART_HEIGHT = 800
+
+CHART_BACKGROUND = (13, 17, 23)
+CHART_GRID = (35, 42, 52)
+CHART_UP = (38, 190, 120)
+CHART_DOWN = (230, 75, 85)
+CHART_LEVEL = (245, 195, 55)
+CHART_HIGHLIGHT = (35, 220, 115)
+
+
+def _chart_font(size):
+    """Load a font available on GitHub Actions/Linux."""
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+    ]
+
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            continue
+
+    return ImageFont.load_default()
+
+
+def make_signal_chart(event):
+    """
+    Create a clean candlestick chart for a signal.
+
+    The chart contains:
+    - 60 candles before the signal candle;
+    - the signal candle itself;
+    - a yellow dashed horizontal level;
+    - a green outline around the signal candle.
+
+    No additional captions, indicators or logos are drawn.
+    """
+
+    bars = event.get("_chart_bars")
+    signal_index = event.get("_chart_index")
+
+    if not bars or signal_index is None:
+        raise ValueError("Chart candle data is missing")
+
+    if signal_index < 0 or signal_index >= len(bars):
+        raise ValueError("Invalid signal candle index")
+
+    visible = bars[:signal_index + 1]
+
+    if not visible:
+        raise ValueError("No candles available for chart")
+
+    image = Image.new(
+        "RGB",
+        (CHART_WIDTH, CHART_HEIGHT),
+        CHART_BACKGROUND
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    # --------------------------------------------------------
+    # Chart layout
+    # --------------------------------------------------------
+
+    plot_left = 80
+    plot_right = 1300
+    plot_top = 65
+    plot_bottom = 735
+
+    candle_area_right = 1050
+
+    plot_height = plot_bottom - plot_top
+    candle_area_width = candle_area_right - plot_left
+
+    # --------------------------------------------------------
+    # Price range and automatic scaling
+    # --------------------------------------------------------
+
+    level_price = float(event["price"])
+
+    price_high = max(
+        float(bar["high"])
+        for bar in visible
+    )
+
+    price_low = min(
+        float(bar["low"])
+        for bar in visible
+    )
+
+    price_high = max(price_high, level_price)
+    price_low = min(price_low, level_price)
+
+    price_range = price_high - price_low
+
+    if price_range <= 0:
+        price_range = max(abs(price_high) * 0.01, 0.000001)
+
+    padding = price_range * 0.08
+
+    price_max = price_high + padding
+    price_min = price_low - padding
+
+    full_range = price_max - price_min
+
+    if full_range <= 0:
+        raise ValueError("Invalid chart price range")
+
+    def price_to_y(price):
+        return int(
+            plot_top
+            + (price_max - price) / full_range * plot_height
+        )
+
+    # --------------------------------------------------------
+    # Subtle horizontal grid
+    # --------------------------------------------------------
+
+    for i in range(6):
+        y = int(
+            plot_top
+            + i * plot_height / 5
+        )
+
+        draw.line(
+            (plot_left, y, plot_right, y),
+            fill=CHART_GRID,
+            width=1
+        )
+
+    # --------------------------------------------------------
+    # Candlesticks
+    # --------------------------------------------------------
+
+    count = len(visible)
+
+    spacing = candle_area_width / max(count, 1)
+
+    candle_width = max(
+        5,
+        min(12, int(spacing * 0.62))
+    )
+
+    signal_candle_box = None
+
+    for i, bar in enumerate(visible):
+        x = int(
+            plot_left
+            + spacing * (i + 0.5)
+        )
+
+        op = float(bar["open"])
+        hi = float(bar["high"])
+        lo = float(bar["low"])
+        cl = float(bar["close"])
+
+        color = (
+            CHART_UP
+            if cl >= op
+            else CHART_DOWN
+        )
+
+        y_high = price_to_y(hi)
+        y_low = price_to_y(lo)
+        y_open = price_to_y(op)
+        y_close = price_to_y(cl)
+
+        # Candle wick
+        draw.line(
+            (x, y_high, x, y_low),
+            fill=color,
+            width=2
+        )
+
+        # Candle body
+        body_top = min(y_open, y_close)
+        body_bottom = max(y_open, y_close)
+
+        if body_bottom - body_top < 2:
+            body_bottom = body_top + 2
+
+        draw.rectangle(
+            (
+                x - candle_width // 2,
+                body_top,
+                x + candle_width // 2,
+                body_bottom
+            ),
+            fill=color,
+            outline=color
+        )
+
+        # Save the signal candle coordinates.
+        if i == signal_index:
+            signal_candle_box = (
+                x,
+                y_high,
+                y_low
+            )
+
+    # --------------------------------------------------------
+    # Yellow dashed horizontal level
+    # --------------------------------------------------------
+
+    level_y = price_to_y(level_price)
+
+    dash_length = 13
+    dash_gap = 9
+
+    x = plot_left
+
+    while x < plot_right:
+        x_end = min(
+            x + dash_length,
+            plot_right
+        )
+
+        draw.line(
+            (x, level_y, x_end, level_y),
+            fill=CHART_LEVEL,
+            width=2
+        )
+
+        x += dash_length + dash_gap
+
+    # --------------------------------------------------------
+    # Price label on the right
+    # --------------------------------------------------------
+
+    font = _chart_font(21)
+
+    price_text = f"{level_price:.12g}"
+
+    text_bbox = draw.textbbox(
+        (0, 0),
+        price_text,
+        font=font
+    )
+
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+
+    label_padding_x = 12
+    label_padding_y = 8
+
+    label_left = 1080
+    label_right = min(
+        CHART_WIDTH - 20,
+        label_left
+        + text_width
+        + label_padding_x * 2
+    )
+
+    label_top = level_y - text_height // 2 - label_padding_y
+    label_bottom = level_y + text_height // 2 + label_padding_y
+
+    # Keep the price label inside the image.
+    if label_top < 10:
+        shift = 10 - label_top
+        label_top += shift
+        label_bottom += shift
+
+    if label_bottom > CHART_HEIGHT - 10:
+        shift = label_bottom - (CHART_HEIGHT - 10)
+        label_top -= shift
+        label_bottom -= shift
+
+    draw.rectangle(
+        (
+            label_left,
+            label_top,
+            label_right,
+            label_bottom
+        ),
+        fill=CHART_BACKGROUND,
+        outline=CHART_LEVEL,
+        width=2
+    )
+
+    draw.text(
+        (
+            label_left + label_padding_x,
+            label_top + label_padding_y - 2
+        ),
+        price_text,
+        fill=CHART_LEVEL,
+        font=font
+    )
+
+    # --------------------------------------------------------
+    # Green outline around the signal candle
+    # Includes the entire wick.
+    # --------------------------------------------------------
+
+    if signal_candle_box is None:
+        raise ValueError("Signal candle was not drawn")
+
+    signal_x, signal_high_y, signal_low_y = signal_candle_box
+
+    highlight_padding_x = 10
+    highlight_padding_y = 9
+
+    box_left = signal_x - candle_width // 2 - highlight_padding_x
+    box_right = signal_x + candle_width // 2 + highlight_padding_x
+
+    box_top = signal_high_y - highlight_padding_y
+    box_bottom = signal_low_y + highlight_padding_y
+
+    draw.rectangle(
+        (
+            box_left,
+            box_top,
+            box_right,
+            box_bottom
+        ),
+        outline=CHART_HIGHLIGHT,
+        width=3
+    )
+
+    # --------------------------------------------------------
+    # Return PNG in memory.
+    # --------------------------------------------------------
+
+    output = BytesIO()
+
+    image.save(
+        output,
+        format="PNG",
+        optimize=True
+    )
+
+    output.seek(0)
+
+    return output
 
 
 # ============================================================
@@ -1284,6 +1629,63 @@ def telegram_post(message, timeout=20):
         return False
 
 
+def telegram_post_photo(message, photo, timeout=30):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print(
+            "[ERROR] Telegram credentials are missing",
+            flush=True
+        )
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+    try:
+        photo.seek(0)
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "caption": message,
+                "parse_mode": "HTML"
+            },
+            files={
+                "photo": (
+                    "gold_scanner_signal.png",
+                    photo,
+                    "image/png"
+                )
+            },
+            timeout=timeout
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("ok") is True:
+            return True
+
+        print(
+            "[ERROR] Telegram rejected chart: "
+            + str(result.get("description", "unknown error")),
+            flush=True
+        )
+
+        return False
+
+    except Exception as exc:
+        print(
+            f"[ERROR] Telegram chart delivery failed: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
+
+        return False
+
+
 def send_telegram(sym, event, atr_pct):
     side = (
         "ШОРТ 🔴"
@@ -1317,9 +1719,29 @@ def send_telegram(sym, event, atr_pct):
         "━━━━━━━━━━━━━━"
     )
 
+    # First try to send the chart with the signal caption.
+    try:
+        chart = make_signal_chart(event)
+
+        if telegram_post_photo(message, chart):
+            print(
+                f"[TELEGRAM] Sent chart: {sym} | {timeframe}",
+                flush=True
+            )
+            return True
+
+    except Exception as exc:
+        print(
+            f"[CHART] Cannot create chart for {sym}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
+
+    # If chart creation or photo delivery failed,
+    # send the original text notification.
     if telegram_post(message):
         print(
-            f"[TELEGRAM] Sent: {sym} | {timeframe}",
+            f"[TELEGRAM] Sent text fallback: {sym} | {timeframe}",
             flush=True
         )
         return True
@@ -1358,6 +1780,68 @@ def send_telegram_test():
     )
 
     return False
+
+
+# ============================================================
+# CHART CANDLE ATTACHMENT
+# ============================================================
+
+def _attach_chart_candle(event, timeframe_bars, interval_seconds):
+    """
+    Find the daily or 4H candle containing the 5m signal time.
+
+    Attach only the 60 preceding candles and the signal candle.
+    This keeps event memory usage small.
+    """
+
+    if not timeframe_bars:
+        return
+
+    touch_time = int(event["touch"])
+
+    signal_index = None
+
+    for i, bar in enumerate(timeframe_bars):
+        candle_start = int(bar["time"])
+        candle_end = candle_start + interval_seconds
+
+        if candle_start <= touch_time < candle_end:
+            signal_index = i
+            break
+
+    # Fallback: use the latest candle that started before
+    # the signal time. Never select a future candle.
+    if signal_index is None:
+        candidates = [
+            i
+            for i, bar in enumerate(timeframe_bars)
+            if int(bar["time"]) <= touch_time
+        ]
+
+        if not candidates:
+            return
+
+        signal_index = candidates[-1]
+
+    start_index = max(
+        0,
+        signal_index - 60
+    )
+
+    event["_chart_bars"] = [
+        {
+            "time": int(bar["time"]),
+            "open": float(bar["open"]),
+            "high": float(bar["high"]),
+            "low": float(bar["low"]),
+            "close": float(bar["close"])
+        }
+        for bar in timeframe_bars[start_index:signal_index + 1]
+    ]
+
+    event["_chart_index"] = (
+        signal_index - start_index
+    )
 
 
 # ============================================================
@@ -1552,6 +2036,12 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 seed_keys.append(key)
 
             elif key not in seen_snapshot:
+                _attach_chart_candle(
+                    event,
+                    days,
+                    86400
+                )
+
                 discovered.append(
                     (sym, event, daily_atr_pct, key)
                 )
@@ -1569,6 +2059,12 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
                 seed_keys.append(key)
 
             elif key not in seen_snapshot:
+                _attach_chart_candle(
+                    event,
+                    four_hours,
+                    14400
+                )
+
                 discovered.append(
                     (sym, event, four_hour_atr_pct, key)
                 )
