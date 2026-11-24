@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
@@ -121,9 +122,9 @@ def make_signal_chart(event):
     Create a clean candlestick chart for a signal.
 
     The chart contains:
-    - 60 candles before the signal candle;
-    - the signal candle itself;
-    - a yellow dashed horizontal level;
+    - candles from the level formation candle to the signal candle;
+    - at least 60 preceding candles when available;
+    - a yellow dashed horizontal level starting at the formation candle;
     - a green outline around the signal candle.
 
     No additional captions, indicators or logos are drawn.
@@ -131,12 +132,19 @@ def make_signal_chart(event):
 
     bars = event.get("_chart_bars")
     signal_index = event.get("_chart_index")
+    level_index = event.get("_chart_level_index")
 
-    if not bars or signal_index is None:
+    if not bars or signal_index is None or level_index is None:
         raise ValueError("Chart candle data is missing")
 
-    if signal_index < 0 or signal_index >= len(bars):
+    if not (0 <= signal_index < len(bars)):
         raise ValueError("Invalid signal candle index")
+
+    if not (0 <= level_index < len(bars)):
+        raise ValueError("Invalid level formation candle index")
+
+    if level_index > signal_index:
+        raise ValueError("Level formation candle is after signal candle")
 
     visible = bars[:signal_index + 1]
 
@@ -230,17 +238,20 @@ def make_signal_chart(event):
     spacing = candle_area_width / max(count, 1)
 
     candle_width = max(
-        5,
+        1,
         min(12, int(spacing * 0.62))
     )
 
     signal_candle_box = None
+    candle_centers = []
 
     for i, bar in enumerate(visible):
         x = int(
             plot_left
             + spacing * (i + 0.5)
         )
+
+        candle_centers.append(x)
 
         op = float(bar["open"])
         hi = float(bar["high"])
@@ -272,11 +283,13 @@ def make_signal_chart(event):
         if body_bottom - body_top < 2:
             body_bottom = body_top + 2
 
+        half_width = max(0, candle_width // 2)
+
         draw.rectangle(
             (
-                x - candle_width // 2,
+                x - half_width,
                 body_top,
-                x + candle_width // 2,
+                x + half_width,
                 body_bottom
             ),
             fill=color,
@@ -293,14 +306,22 @@ def make_signal_chart(event):
 
     # --------------------------------------------------------
     # Yellow dashed horizontal level
+    # Starts exactly at the level formation candle.
     # --------------------------------------------------------
 
     level_y = price_to_y(level_price)
 
+    formation_x = candle_centers[level_index]
+
+    level_start_x = max(
+        plot_left,
+        int(formation_x - spacing / 2)
+    )
+
     dash_length = 13
     dash_gap = 9
 
-    x = plot_left
+    x = level_start_x
 
     while x < plot_right:
         x_end = min(
@@ -1788,16 +1809,23 @@ def send_telegram_test():
 
 def _attach_chart_candle(event, timeframe_bars, interval_seconds):
     """
-    Find the daily or 4H candle containing the 5m signal time.
+    Find:
+    1. The timeframe candle containing the 5m signal.
+    2. The exact timeframe candle that formed the level.
 
-    Attach only the 60 preceding candles and the signal candle.
-    This keeps event memory usage small.
+    Keep 60 candles before the signal when possible.
+    Never cut off the actual level formation candle.
     """
 
     if not timeframe_bars:
         return
 
     touch_time = int(event["touch"])
+    formation_time = int(event["time"])
+
+    # --------------------------------------------------------
+    # Find signal candle
+    # --------------------------------------------------------
 
     signal_index = None
 
@@ -1809,8 +1837,7 @@ def _attach_chart_candle(event, timeframe_bars, interval_seconds):
             signal_index = i
             break
 
-    # Fallback: use the latest candle that started before
-    # the signal time. Never select a future candle.
+    # Fallback: latest candle that started before signal time.
     if signal_index is None:
         candidates = [
             i
@@ -1819,14 +1846,61 @@ def _attach_chart_candle(event, timeframe_bars, interval_seconds):
         ]
 
         if not candidates:
-            return
+            raise ValueError(
+                "Cannot find signal timeframe candle"
+            )
 
         signal_index = candidates[-1]
 
-    start_index = max(
+    # --------------------------------------------------------
+    # Find exact level formation candle
+    # --------------------------------------------------------
+
+    formation_index = None
+
+    for i, bar in enumerate(timeframe_bars):
+        if int(bar["time"]) == formation_time:
+            formation_index = i
+            break
+
+    # Fallback in case exchange timestamps differ slightly.
+    if formation_index is None:
+        candidates = [
+            i
+            for i, bar in enumerate(timeframe_bars)
+            if int(bar["time"]) <= formation_time
+        ]
+
+        if not candidates:
+            raise ValueError(
+                "Cannot find level formation candle"
+            )
+
+        formation_index = candidates[-1]
+
+    if formation_index > signal_index:
+        raise ValueError(
+            "Level formation candle is later than signal candle"
+        )
+
+    # --------------------------------------------------------
+    # Keep 60 candles before signal, but never cut off
+    # the candle that formed the level.
+    # --------------------------------------------------------
+
+    sixty_candles_start = max(
         0,
         signal_index - 60
     )
+
+    start_index = min(
+        sixty_candles_start,
+        formation_index
+    )
+
+    selected_bars = timeframe_bars[
+        start_index:signal_index + 1
+    ]
 
     event["_chart_bars"] = [
         {
@@ -1836,11 +1910,15 @@ def _attach_chart_candle(event, timeframe_bars, interval_seconds):
             "low": float(bar["low"]),
             "close": float(bar["close"])
         }
-        for bar in timeframe_bars[start_index:signal_index + 1]
+        for bar in selected_bars
     ]
 
     event["_chart_index"] = (
         signal_index - start_index
+    )
+
+    event["_chart_level_index"] = (
+        formation_index - start_index
     )
 
 
