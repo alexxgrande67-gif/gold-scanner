@@ -44,8 +44,8 @@ FB = {
     "leaveAtr": 0.5
 }
 
-TOP_UNIVERSE = 500
-MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
+TOP_UNIVERSE = 1000
+MAX_MONITORED = int(os.getenv("MAX_MONITORED", "1000"))
 
 SCAN_WORKERS = max(
     1,
