@@ -2351,28 +2351,29 @@ def main():
         key=lambda item: item[1]["touch"]
     )
 
+    
     for sym, event, atr_pct, key in discovered:
 
-    # Не отправляем сигналы старше 15 минут
-    signal_age = time.time() - event["touch"]
+        # Не отправляем сигналы старше 15 минут
+        signal_age = time.time() - event["touch"]
 
-    if signal_age > 15 * 60:
-        print(
-            f"[SKIP OLD SIGNAL] {sym} | "
-            f"{event.get('timeframe', '1D')} | "
-            f"возраст сигнала: {signal_age / 60:.1f} мин.",
-            flush=True
+        if signal_age > 15 * 60:
+            print(
+                f"[SKIP OLD SIGNAL] {sym} | "
+                f"{event.get('timeframe', '1D')} | "
+                f"возраст сигнала: {signal_age / 60:.1f} мин.",
+                flush=True
+            )
+            continue
+
+        side = (
+            "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ"
+            if event["side"] == "H"
+            else "ЛОЖНЫЙ ПРОБОЙ ВНИЗ"
         )
 
-        continue
-
-    side = (
-        "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ"
-        if event["side"] == "H"
-        else "ЛОЖНЫЙ ПРОБОЙ ВНИЗ"
-    )
-
         dt = time.strftime(
+
             "%Y-%m-%d %H:%M UTC",
             time.gmtime(event["touch"])
         )
