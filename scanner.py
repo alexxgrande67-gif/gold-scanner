@@ -9,6 +9,8 @@ import math
 import os
 import time
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1070,14 +1072,21 @@ def telegram_post(message, timeout=20):
 
 def send_telegram(sym, event, atr_pct):
     side = (
-        "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ 🔴"
+        "ШОРТ 🔴"
         if event["side"] == "H"
-        else "ЛОЖНЫЙ ПРОБОЙ ВНИЗ 🟢"
+        else "ЛОНГ 🟢"
     )
 
-    dt = time.strftime(
-        "%d.%m.%Y %H:%M UTC",
-        time.gmtime(event["touch"])
+    signal_time = datetime.fromtimestamp(
+        event["touch"],
+        tz=ZoneInfo("Asia/Tbilisi")
+    )
+
+    dt = signal_time.strftime("%d.%m.%Y %H:%M")
+
+    level_age_days = max(
+        0,
+        int((event["touch"] - event["time"]) // 86400)
     )
 
     message = (
@@ -1086,9 +1095,8 @@ def send_telegram(sym, event, atr_pct):
         f"Монета: <b>{html.escape(sym)}</b>\n"
         f"Сигнал: <b>{side}</b>\n"
         f"Уровень: <code>{event['price']:.12g}</code>\n"
-        f"Время свечи: {dt}\n"
-        f"ATR: {atr_pct:.2f}%\n"
-        f"Биржа: {ACTIVE_EXCHANGE.upper()}\n"
+        f"Давность уровня: <b>{level_age_days} дн.</b>\n"
+        f"Время сигнала: {dt}\n"
         "━━━━━━━━━━━━━━"
     )
 
